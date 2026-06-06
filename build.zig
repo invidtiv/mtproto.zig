@@ -3,6 +3,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // The proxy parses untrusted network input (FakeTLS/obfuscation/middleproxy/
+    // socks5/http/TOML) on the most internet-exposed process. Ship its data plane
+    // with runtime bounds/overflow/null checks ON: a single off-by-one becomes a
+    // safe panic instead of exploitable UB. mtbuddy/bench keep the requested mode.
+    // ReleaseSafe grows the binary and adds parse-loop overhead (AES is HW
+    // accelerated) vs the marketed ReleaseFast numbers — measure before relying on
+    // them. Override with -Ddataplane_safety=false to force the requested mode.
+    const dataplane_safety = b.option(
+        bool,
+        "dataplane_safety",
+        "Build the internet-facing proxy with runtime safety on (ReleaseSafe) even in release builds (default: true)",
+    ) orelse true;
+    const dataplane_optimize: std.builtin.OptimizeMode =
+        if (dataplane_safety and optimize == .ReleaseFast) .ReleaseSafe else optimize;
     const pinned_minisign_pubkey = "RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO";
     const minisign_pubkey = b.option(
         []const u8,
@@ -32,7 +47,7 @@ pub fn build(b: *std.Build) void {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dataplane_optimize,
         .imports = &.{
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
@@ -43,6 +58,14 @@ pub fn build(b: *std.Build) void {
         .name = "mtproto-proxy",
         .root_module = exe_mod,
     });
+
+    // Exploit mitigation on the internet-facing proxy: position-independent
+    // executable (ASLR). Full RELRO is already Zig's default (link_z_relro =
+    // true, link_z_lazy = false → -z relro -z now). Stack canaries are NOT
+    // enabled because they require libc (__stack_chk_fail) and this binary is
+    // deliberately libc-free; ReleaseSafe bounds/overflow checks cover the data
+    // plane instead.
+    exe.pie = true;
 
     b.installArtifact(exe);
 
@@ -92,6 +115,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const proxy_http_fetch_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy/http_fetch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const proxy_net_helpers_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy/net_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
         .target = target,
@@ -101,6 +136,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
             .{ .name = "proxy_config", .module = proxy_config_mod },
+            .{ .name = "proxy_http_fetch", .module = proxy_http_fetch_mod },
+            .{ .name = "proxy_net_helpers", .module = proxy_net_helpers_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
     });

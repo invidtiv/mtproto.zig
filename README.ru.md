@@ -2,11 +2,13 @@
 
 # mtproto.zig
 
-**Высокопроизводительный Telegram MTProto proxy на Zig**
+**Держите близких на связи.**
 
-Маскирует Telegram-трафик под обычный TLS 1.3 HTTPS, чтобы обходить сетевую цензуру.
+Крошечный Telegram-прокси, который вы запускаете на своём сервере. Он прячется в обычном HTTPS — цензуре его не найти, а вашим близким не потерять. Установка одной командой, одна ссылка, чтобы поделиться.
 
-**177 КБ бинарник · меньше 1 МБ RAM · старт <10 мс · ноль зависимостей**
+`177 КБ · меньше 1 МБ RAM · 0 зависимостей` — да, он настолько лёгкий *(подробности ниже ↓)*
+
+<sub>Технически: крошечный MTProto-прокси на Zig без зависимостей, маскирует трафик Telegram под обычный TLS 1.3 HTTPS.</sub>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
@@ -29,7 +31,18 @@
 
 ---
 
-## Почему этот прокси?
+## Для кого это
+
+- **Вы там, где Telegram режут или блокируют**, и хотите просто вернуть его.
+- **Вы — тот, к кому семья идёт за помощью**, и хотите защитить родителей и друзей ссылкой, которую они нажимают один раз и больше о ней не думают.
+
+Прокси работает на **вашем сервере** — ваши сообщения никогда не идут через наш, и регистрироваться нигде не нужно. Открытый код под лицензией MIT; прокси намеренно не пишет в логи ни секреты, ни кто подключается.
+
+## Чем это лучше VPN?
+
+VPN заметен — цензор узнаёт протокол и блокирует его, а VPN на всё устройство медленный и сажает батарею. Этот прокси выглядит как обычный HTTPS-сайт, ведёт только Telegram, и тем, кому вы дали ссылку, **не нужно ничего устанавливать**: они нажимают одну ссылку, остальное Telegram делает сам. Помещается на самый дешёвый VPS, стартует мгновенно, больше ничего настраивать не нужно.
+
+## В сравнении с другими MTProto-прокси
 
 Большинство MTProto-прокси крупные, тянут зависимости и потребляют много памяти. Этот проект устроен иначе:
 
@@ -55,7 +68,7 @@ Zig даёт производительность и минимальный foot
 |---|---|
 | **Fake TLS 1.3** | Соединения выглядят как обычный HTTPS |
 | **DRS** | Имитирует размеры TLS-record у Chrome/Firefox |
-| **Zero-RTT masking** | Локальный Nginx отвечает на активные пробы TLS |
+| **Маскировка от активных проб** | Если цензор проверяет ваш сервер, он получает настоящий TLS-хендшейк от локального веб-бэкенда (реальный серт, если домен ваш, иначе self-signed), а не молчащий прокси. Опционально: фронтить реальный `tls_domain:443` для доменов с одноходовым x25519 |
 | **TCPMSS=88** | Дробит ClientHello на маленькие TCP-пакеты |
 | **nfqws TCP desync** | Fake packets + TTL-limited splits против stateful DPI |
 | **Split-TLS** | 1-байтовые Application records против пассивных сигнатур |
@@ -87,19 +100,19 @@ curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/boo
 
 ```bash
 # Минимально: secret генерируется автоматически, DPI-модули включены
-sudo mtbuddy install --port 443 --domain wb.ru --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --yes
 
 # Свой secret и имя пользователя
-sudo mtbuddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --secret <32-hex> --user alice --yes
 
 # Без DPI-модулей, только bare proxy
-sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --no-dpi --yes
 
 # Установка из существующего config.toml
 sudo mtbuddy install --config /path/to/config.toml --yes
 
 # Явно разрешить unsigned mode (не рекомендуется)
-sudo mtbuddy install --insecure --port 443 --domain wb.ru --yes
+sudo mtbuddy install --insecure --port 443 --domain rutube.ru --yes
 ```
 
 В конце `mtbuddy` напечатает готовую `tg://` ссылку для подключения.
@@ -136,7 +149,7 @@ sudo mtbuddy --interactive
 |---|---|---|
 | `--port, -p` | `443` | Порт прокси |
 | `--public-port` | — | Порт, который будет указан в Telegram-ссылках |
-| `--domain, -d` | `wb.ru` | Домен TLS-маскировки |
+| `--domain, -d` | `rutube.ru` | Домен TLS-маскировки (⚠️ **неизменен** — см. примечание ниже) |
 | `--secret, -s` | auto | User secret, 32 hex chars |
 | `--user, -u` | `user` | Имя пользователя в `config.toml` |
 | `--config, -c` | — | Использовать существующий `config.toml` |
@@ -151,6 +164,10 @@ sudo mtbuddy --interactive
 | `--ipv6-hop` | — | Включить IPv6 auto-hopping |
 | `--version, -v <tag>` | `latest` | Версия релиза |
 | `--insecure` | — | Разрешить unsigned assets (не рекомендуется) |
+
+> ⚠️ **Выберите `--domain` один раз.** tg://-ссылки вшивают `tls_domain`, поэтому смена
+> домена на живом сервере (в т.ч. через `mtbuddy setup masking --domain …`)
+> **инвалидирует все уже розданные ссылки.** См. [ARCHITECTURE.md](ARCHITECTURE.md) / [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ---
 
@@ -178,9 +195,10 @@ sudo mtbuddy status
 # Проверка и просмотр конфига
 sudo mtbuddy config validate
 sudo mtbuddy config doctor
+sudo mtbuddy config doctor --network
 sudo mtbuddy config print-effective
 
-# Напечатать Telegram proxy links из config.toml
+# Напечатать ссылки из config.toml (по умолчанию FakeTLS ee; +dd при fake_tls_only=false; секретный вывод)
 sudo mtbuddy links
 sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config.toml
 
@@ -191,7 +209,7 @@ mtbuddy secret
 sudo mtbuddy reload
 
 # Настроить DPI-модули после установки
-sudo mtbuddy setup masking --domain wb.ru
+sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
@@ -308,7 +326,9 @@ username = "admin"    # optional
 password = "secret"
 ```
 
-> **Важно:** через upstream маршрутизируется только трафик к DC. Mask/camouflage-соединения всегда идут напрямую.
+> **Важно:** через upstream маршрутизируется трафик к DC и refresh MiddleProxy metadata (`getProxyConfig` / `getProxySecret`). Mask/camouflage-соединения всегда идут напрямую.
+
+> **О зависимостях:** «ноль зависимостей» верно для дефолтного `auto`/`direct`. В режимах `socks5`, `http` или `tunnel` refresh метаданных MiddleProxy вызывает `curl`, поэтому `curl` должен быть установлен на хосте (штатный установщик ставит его сам).
 
 ---
 
@@ -330,11 +350,12 @@ port = 443
 # public_port = 443                 # порт в ссылках при HAProxy/Nginx
 # middle_proxy_nat_ip = "203.0.113.10"   # исходящий IPv4, который видит Telegram MiddleProxy
 max_connections = 512
+# workers = 1            # SO_REUSEPORT epoll-воркеры: 1 = однопоточно (дефолт); 0 = по числу CPU; N распределяет нагрузку по ядрам
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"
-rate_limit_per_subnet = 30
+rate_limit_per_subnet = 0   # 0 = выключено (по умолчанию; не ложно-срабатывает на carrier-NAT). Для не-NAT хостов задайте напр. 30
 handshake_flood_guard_enabled = true
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
@@ -342,10 +363,10 @@ handshake_flood_guard_block_sec = 120
 tag = ""                  # Optional: promotion tag from @MTProxybot
 
 [censorship]
-tls_domain = "wb.ru"
+tls_domain = "rutube.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host для Docker/remote Nginx
-mask_port = 8443
+mask_port = 8443          # 8443 = локальный Nginx (так ставит mtbuddy); 443 = фронт реального tls_domain (опционально, только домены с одноходовым x25519)
 fast_mode = true
 drs = true
 
@@ -372,9 +393,10 @@ alice = true
 | `[server] public_port` | `[server].port` | Порт для клиентских ссылок, если публичный порт отличается от listen-port |
 | `[server] middle_proxy_nat_ip` | auto | Исходящий IPv4 для MiddleProxy key derivation; auto-detect не использует `public_ip`, задайте явно при VPN/NAT egress |
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
+| `[server] workers` | `1` | SO_REUSEPORT epoll-воркеры: `1` = однопоточно; `0` = по числу CPU; `N` распределяет нагрузку relay/crypto по ядрам. При `>1` перезагрузка конфига по SIGHUP требует рестарта |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
 | `[server] tag` | — | 32-hex promotion tag от [@MTProxybot](https://t.me/MTProxybot) |
-| `[server] rate_limit_per_subnet` | `30` | Лимит новых соединений в секунду на /24 (IPv4) или /48 (IPv6), `0` отключает |
+| `[server] rate_limit_per_subnet` | `0` | Лимит новых соединений/сек на /24 (IPv4) или /48 (IPv6). `0` = выключено (по умолчанию, NAT-friendly); для не-NAT хостов задайте напр. `30` |
 | `[server] handshake_flood_guard_enabled` | `true` | Временно отклонять IP, которые часто не проходят MTProto handshake |
 | `[server] handshake_flood_guard_threshold` | `20` | Число плохих handshake/rate/budget событий с одного IP до временного deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
@@ -389,7 +411,11 @@ alice = true
 
 > Secret можно сгенерировать через `mtbuddy secret` или `openssl rand -hex 16`.
 >
-> Ссылки печатаются командой `sudo mtbuddy links`. Runtime-логи намеренно скрывают secrets и proxy links.
+> Ссылки печатаются командой `sudo mtbuddy links`: по умолчанию показываются только FakeTLS (`ee...domain`) ссылки; secure padded (`dd...`) варианты выводятся, когда включён транспорт `dd` (`fake_tls_only = false`). Runtime-логи намеренно скрывают secrets и proxy links.
+>
+> **Транспорт `dd` («secure»/padded) по умолчанию отключён** (`[censorship].fake_tls_only = true`) — это обычный обфусцированный MTProto **без TLS-маскировки**, который DPI фингерпринтит напрямую как MTProto. По умолчанию прокси принимает только FakeTLS (`ee`), и `mtbuddy links` печатает только `ee`-ссылки. Чтобы раздавать `dd`-ссылки (сценарии с низким DPI / совместимость), задайте `fake_tls_only = false`. См. [THREAT_MODEL.md](THREAT_MODEL.md).
+>
+> Per-subnet rate limit **по умолчанию выключен** (`rate_limit_per_subnet = 0`), чтобы carrier-NAT/офисные сети (много легитимных клиентов за одним IP/подсетью) не получали ложных блокировок. Handshake flood guard остаётся включённым, но с выключенным subnet-лимитом он реагирует только на брошенные/незавершённые handshake — которые легитимные владельцы secret практически не создают. Если `flood_guard+` всё же блокирует реальных пользователей при burst, поднимите `handshake_flood_guard_threshold` / window / block или задайте `handshake_flood_guard_enabled = false`. `rate_limit_per_subnet` включайте только на single-tenant / не-NAT хостах.
 
 ---
 
@@ -405,7 +431,7 @@ ssh -L 61208:localhost:61208 root@<server_ip>
 # → http://localhost:61208
 ```
 
-Можно также открыть dashboard напрямую через секцию `[monitor]`, но у него нет встроенной auth. Не публикуйте его без firewall или reverse proxy с auth/TLS.
+Dashboard требует **HTTP Basic auth** (имя пользователя: любое; пароль генерируется автоматически в `/opt/mtproto-proxy/monitor/dashboard.token` — выведите его командой `cat` на сервере). Это root-привилегированная панель управления, поэтому держите её на loopback/SSH-туннеле и никогда не публикуйте по plain HTTP — только за HTTPS + reverse proxy.
 
 <details>
 <summary>Демо: dashboard</summary>
@@ -573,6 +599,7 @@ journalctl -u mtproto-proxy | grep -E "dc=203|Middle"
 ```
 
 Прокси обновляет DC203 metadata с Telegram на старте. Если `core.telegram.org` недоступен, используются bundled fallback addresses.
+При `[upstream].type = "socks5"` или `"http"` metadata refresh идёт через этот upstream; проверьте путь командой `sudo mtbuddy config doctor --network`.
 
 ---
 

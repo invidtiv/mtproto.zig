@@ -2,11 +2,13 @@
 
 # mtproto.zig
 
-**High-performance Telegram MTProto proxy written in Zig**
+**Keep the people you love connected.**
 
-Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
+A tiny Telegram proxy you run on your own server. It hides inside ordinary HTTPS, so censorship can't find it — and your family can't lose it. One command to set up, one link to share.
 
-**177 KB binary · Sub-1 MB RAM · Boots in <10 ms · Zero dependencies**
+`177 KB · under 1 MB RAM · 0 dependencies` — yes, it's that lean *(details below ↓)*
+
+<sub>Technically: a tiny, dependency-free MTProto proxy in Zig that disguises Telegram traffic as standard TLS 1.3 HTTPS.</sub>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
@@ -29,7 +31,18 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ---
 
-## Why this one?
+## Who it's for
+
+- **You live somewhere Telegram is throttled or blocked** and you just want it back.
+- **You're the one your family asks for help** — and you want to protect your parents and friends with a link they tap once and never think about again.
+
+It runs on **your own server** — your messages never pass through ours, and there's nothing to sign up for. Open source under MIT; the proxy deliberately never logs secrets or who connects.
+
+## Why not just a VPN?
+
+A VPN announces itself — censors recognize the protocol and block it, and a whole-device VPN is slow and drains the battery. This looks like a plain HTTPS website, carries only Telegram, and the people you share it with **install nothing**: they tap one link and Telegram does the rest. Small enough for the cheapest VPS you can rent, it starts instantly, and there's nothing else to set up.
+
+## Compared to other MTProto proxies
 
 Most MTProto proxies are large, dependency-heavy, and use lots of memory. This one is different:
 
@@ -49,13 +62,13 @@ We chose Zig because it provides the raw performance and micro-footprint of C, b
 - **Hermetic cross-compilation:** Run `zig build` on macOS, and out comes a statically linked Linux binary. No Docker, no `glibc` version mismatches.
 - **Comptime:** Costly operations like protocol definition mapping, endianness conversions, and bilingual string lookup for `mtbuddy` are resolved during compilation, giving instant startup times.
 
-It also ships more evasion techniques than any of the above:
+**You don't need to understand any of the names below — the default install turns them all on for you.** Under the hood, the proxy stacks more anti-censorship techniques than any other MTProto proxy, and keeps adapting as the blocks get smarter:
 
 | Technique | What it does |
 |---|---|
 | **Fake TLS 1.3** | Connections look like normal HTTPS to DPI |
 | **DRS** | Mimics Chrome/Firefox TLS record sizes |
-| **Zero-RTT masking** | Local Nginx serves real TLS responses to active probes, defeating timing analysis |
+| **Active-probe masking** | If a censor probes your server, it gets a real TLS handshake from a local web backend (a real cert if you own the domain, else self-signed) instead of a tell-tale silent proxy. Optional: front the real `tls_domain:443` for single-round-x25519 domains |
 | **TCPMSS=88** | Fragments ClientHello across 6 TCP packets, breaking DPI reassembly |
 | **nfqws TCP desync** | Sends fake packets + TTL-limited splits to confuse stateful DPI |
 | **Split-TLS** | 1-byte Application records to defeat passive signatures |
@@ -87,22 +100,25 @@ This downloads the latest `mtbuddy` binary, verifies minisign signature + SHA-25
 
 ```bash
 # Minimal — auto-generates a secret, enables all DPI bypass modules
-sudo mtbuddy install --port 443 --domain wb.ru --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --yes
 
 # Bring your own secret and username
-sudo mtbuddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --secret <32-hex> --user alice --yes
 
 # Disable all DPI modules (bare proxy only)
-sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --no-dpi --yes
 
 # Install using an existing config file (auto-maps port and domain)
 sudo mtbuddy install --config /path/to/config.toml --yes
 
 # Explicitly allow unsigned mode (not recommended)
-sudo mtbuddy install --insecure --port 443 --domain wb.ru --yes
+sudo mtbuddy install --insecure --port 443 --domain rutube.ru --yes
 ```
 
 At the end, mtbuddy prints a ready-to-use `tg://` connection link.
+
+> **Share it with someone you love.** Send them this, with the link:
+> *"I set up a private door to Telegram for us. Tap this link, choose Connect, and Telegram will work again — nothing to install, nothing to pay, and it's only ours."*
 
 ### Interactive wizard
 
@@ -138,7 +154,7 @@ sudo mtbuddy --interactive
 |---|---|---|
 | `--port, -p` | `443` | Proxy listen port |
 | `--public-port` | — | Port advertised in generated Telegram links |
-| `--domain, -d` | `wb.ru` | TLS masking domain |
+| `--domain, -d` | `rutube.ru` | TLS masking domain (⚠️ **immutable** — see note below) |
 | `--secret, -s` | auto | User secret (32 hex chars) |
 | `--user, -u` | `user` | Username in `config.toml` |
 | `--config, -c` | — | Use existing `config.toml` file |
@@ -147,12 +163,17 @@ sudo mtbuddy --interactive
 | `--bind, -b` | — | Bind to specific IP (default: all interfaces) |
 | `--no-masking` | — | Disable Nginx masking |
 | `--no-nfqws` | — | Disable nfqws TCP desync |
-| `--no-tcpmss` | — | Disable TCPMSS=88 |
+| `--no-tcpmss` | — | Disable TCPMSS clamp |
+| `--tcpmss <n>` | `88` | TCPMSS clamp value (forces ClientHello fragmentation) |
 | `--no-dpi` | — | Disable all DPI modules |
 | `--middle-proxy` | — | Enable Telegram MiddleProxy relay |
 | `--ipv6-hop` | — | Enable IPv6 auto-hopping |
 | `--version, -v <tag>` | `latest` | Release version to install |
 | `--insecure` | — | Allow unsigned assets (not recommended) |
+
+> ⚠️ **Pick `--domain` once.** The tg:// links embed `tls_domain`, so changing it on a
+> live deployment (including via `mtbuddy setup masking --domain …`) **invalidates every
+> link you've already shared.** See [ARCHITECTURE.md](ARCHITECTURE.md) / [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ---
 
@@ -180,9 +201,10 @@ sudo mtbuddy status
 # Validate and inspect config
 sudo mtbuddy config validate
 sudo mtbuddy config doctor
+sudo mtbuddy config doctor --network
 sudo mtbuddy config print-effective
 
-# Print Telegram proxy links from config.toml (sensitive output)
+# Print Telegram proxy links from config.toml (FakeTLS ee by default; +dd when fake_tls_only=false; sensitive output)
 sudo mtbuddy links
 sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config.toml
 
@@ -193,7 +215,7 @@ mtbuddy secret
 sudo mtbuddy reload
 
 # Setup DPI modules after the fact
-sudo mtbuddy setup masking --domain wb.ru
+sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
@@ -320,7 +342,9 @@ username = "admin"    # optional, omit for no-auth
 password = "secret"
 ```
 
-> **Note:** Only DC-bound traffic is routed through the configured upstream. Mask (camouflage) connections always go direct.
+> **Note:** DC-bound relay traffic and MiddleProxy metadata refreshes (`getProxyConfig` / `getProxySecret`) use the configured upstream. Mask (camouflage) connections always go direct.
+>
+> **Dependency note:** the "zero dependencies" claim holds for the default `auto`/`direct` egress. With `socks5`, `http`, or `tunnel` upstream modes, MiddleProxy metadata refresh shells out to `curl`, so `curl` must be installed on the host (the standard installer pulls it in).
 
 ---
 
@@ -342,11 +366,12 @@ port = 443
 # public_port = 443                 # Link port when behind HAProxy/Nginx
 # middle_proxy_nat_ip = "203.0.113.10"   # Outbound IPv4 seen by Telegram MiddleProxy
 max_connections = 512
+# workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
-rate_limit_per_subnet = 30
+rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
 handshake_flood_guard_enabled = true
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
@@ -354,10 +379,10 @@ handshake_flood_guard_block_sec = 120
 tag = ""                  # Optional: promotion tag from @MTProxybot
 
 [censorship]
-tls_domain = "wb.ru"
+tls_domain = "rutube.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host (Docker/remote Nginx)
-mask_port = 8443          # 8443 for local Nginx zero-RTT masking
+mask_port = 8443          # 8443 = local Nginx backend (what mtbuddy installs); 443 = front the real tls_domain (opt-in, single-round-x25519 domains only)
 fast_mode = true          # Recommended: delegates S2C AES to the DC, saves CPU/RAM
 drs = true                # Dynamic Record Sizing (mimics Chrome/Firefox)
 
@@ -396,13 +421,14 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] middle_proxy_nat_ip` | auto | Outbound IPv4 used in MiddleProxy key derivation; auto-detected independently from `public_ip`, set explicitly when DC traffic exits through a VPN/NAT IP |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
+| `[server] workers` | `1` | SO_REUSEPORT epoll worker threads. `1` = single-threaded; `0` = one per CPU; `N` spreads relay/crypto load across cores. SIGHUP config reload requires a restart when `>1` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |
 | `[server] handshake_timeout_sec` | `15` | Handshake completion timeout |
 | `[server] graceful_shutdown_timeout_sec` | `15` | SIGTERM drain timeout before force-close |
 | `[server] middleproxy_buffer_kb` | `1024` | ME per-connection buffer (KiB). Below 1024 may cause overflow on media traffic |
 | `[server] tag` | — | 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
-| `[server] rate_limit_per_subnet` | `30` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). Set `0` to disable |
+| `[server] rate_limit_per_subnet` | `0` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). `0` = disabled (default, NAT-friendly); set e.g. `30` for non-NAT hosts |
 | `[server] handshake_flood_guard_enabled` | `true` | Temporarily deny exact source IPs that repeatedly fail the MTProto handshake |
 | `[server] handshake_flood_guard_threshold` | `20` | Bad handshake/rate/budget events per source IP before temporary deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Rolling window for `handshake_flood_guard_threshold` |
@@ -427,7 +453,11 @@ alice = true   # bypass MiddleProxy for this user
 
 > Generate a secret: `mtbuddy secret` or `openssl rand -hex 16`
 >
-> Print client links explicitly: `sudo mtbuddy links`. Runtime proxy logs intentionally hide secrets and proxy links.
+> Print client links explicitly: `sudo mtbuddy links`. By default it prints FakeTLS (`ee...domain`) links only; it also prints secure padded (`dd...`) links when the `dd` transport is enabled (`fake_tls_only = false`). Runtime proxy logs intentionally hide secrets and proxy links.
+>
+> **The `dd` ("secure"/padded) transport is rejected by default** (`[censorship].fake_tls_only = true`) — it is plain obfuscated MTProto with **no TLS disguise**, directly fingerprintable as MTProto by DPI. By default the proxy accepts only FakeTLS (`ee`), and `mtbuddy links` prints only `ee` links. To hand out `dd` links (lower-DPI / compatibility scenarios), set `fake_tls_only = false`. See [THREAT_MODEL.md](THREAT_MODEL.md).
+>
+> The per-subnet new-connection rate limit is **off by default** (`rate_limit_per_subnet = 0`) so large carrier-NAT or shared-office networks (many legitimate clients behind one IP/subnet) aren't false-positived. The handshake flood guard stays on but, with the subnet limit off, it only acts on abandoned/incomplete handshakes — which legitimate secret-holders virtually never produce. If you still see `flood_guard+` blocking real users in bursts, raise `handshake_flood_guard_threshold` / window / block, or set `handshake_flood_guard_enabled = false`. Enable `rate_limit_per_subnet` only on single-tenant / non-NAT hosts.
 
 ---
 
@@ -446,7 +476,7 @@ ssh -L 61208:localhost:61208 root@<server_ip>
 # → http://localhost:61208
 ```
 
-Alternatively, expose the dashboard port via `[monitor]` config section and access directly.
+The dashboard requires **HTTP Basic auth** (username: any; password auto-generated at `/opt/mtproto-proxy/monitor/dashboard.token` — `cat` it on the server). It is a root-privileged control plane, so keep it on the loopback/SSH-tunnel path and never expose plain HTTP to the internet — front it with HTTPS + a reverse proxy if you must.
 
 <details>
 <summary>Demo: monitoring dashboard</summary>
@@ -626,6 +656,7 @@ Fix: `iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT`
 **5. DC203 media resets on non-premium clients.**
 Check logs: `journalctl -u mtproto-proxy | grep -E "dc=203|Middle"`.
 The proxy auto-refreshes DC203 metadata from Telegram on startup. If `core.telegram.org` is unreachable, it uses bundled fallback addresses.
+With `[upstream].type = "socks5"` or `"http"`, metadata refreshes use that upstream; run `sudo mtbuddy config doctor --network` to verify the proxy endpoint and Telegram metadata fetch path.
 
 ---
 

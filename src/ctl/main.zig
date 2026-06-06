@@ -5,8 +5,8 @@
 //! and non-interactive CLI with flags.
 //!
 //! One-liner install:
-//!   sudo mtbuddy install --port 443 --domain wb.ru --yes
-//!   sudo mtbuddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --secret <hex> --user myuser --yes
 //!
 //! Interactive wizard:
 //!   sudo mtbuddy --interactive
@@ -91,6 +91,12 @@ pub fn main(init: std.process.Init) !void {
             );
             ui.lang = if (lang_choice == 1) .ru else .en;
         }
+
+        ui.print("  {s}{s}{s}\n", .{
+            Color.dim,
+            tr(ui.lang, "Hi — I'm mtbuddy. Let's get your people online.", "Привет — я mtbuddy. Давайте подключим ваших близких."),
+            Color.reset,
+        });
 
         try interactiveMain(&ui, allocator);
         return;
@@ -281,24 +287,26 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     const sys = @import("sys.zig");
 
     const svc_active = sys.isServiceActive("mtproto-proxy");
+    // The one question the user opened this to answer — first, in plain words.
     if (svc_active) {
-        ui.ok(tr(ui.lang, "mtproto-proxy is running", "mtproto-proxy запущен"));
+        ui.ok(tr(ui.lang, "You're online — your proxy is up and accepting connections.", "Вы онлайн — прокси работает и принимает подключения."));
     } else {
-        ui.fail(tr(ui.lang, "mtproto-proxy is not running", "mtproto-proxy не запущен"));
+        ui.fail(tr(ui.lang, "Your proxy is offline — friends can't connect until it's back. Try \"Restart proxy\".", "Прокси офлайн — близкие не смогут подключиться, пока он не запустится. Попробуйте «Перезапустить прокси»."));
     }
+    ui.writeRaw("\n");
 
     const nginx_active = sys.isServiceActive("nginx");
     if (nginx_active) {
-        ui.ok(tr(ui.lang, "nginx is running", "nginx запущен"));
+        ui.ok(tr(ui.lang, "Camouflage backend (Nginx) is running", "Бэкенд маскировки (Nginx) запущен"));
     } else {
-        ui.info(tr(ui.lang, "nginx is not running (masking may be disabled)", "nginx не запущен (маскировка может быть выключена)"));
+        ui.info(tr(ui.lang, "Camouflage backend (Nginx) is not running", "Бэкенд маскировки (Nginx) не запущен"));
     }
 
     const nfqws_active = sys.isServiceActive("nfqws-mtproto");
     if (nfqws_active) {
-        ui.ok(tr(ui.lang, "nfqws-mtproto is running", "nfqws-mtproto запущен"));
+        ui.ok(tr(ui.lang, "Extra TCP protection (nfqws) is running", "Дополнительная TCP-защита (nfqws) запущена"));
     } else {
-        ui.info(tr(ui.lang, "nfqws-mtproto is not running (TCP desync disabled)", "nfqws-mtproto не запущен (TCP desync выключен)"));
+        ui.info(tr(ui.lang, "Extra TCP protection (nfqws) is not running", "Дополнительная TCP-защита (nfqws) не запущена"));
     }
 
     const timer_active = sys.isServiceActive("mtproto-mask-health.timer");
@@ -347,22 +355,28 @@ fn printHelp(lang: i18n.Lang) void {
     var ui = Tui.init(lang);
 
     ui.writeRaw("\n");
-    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  {s}\n\n", .{
+    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  {s}{s}{s}\n", .{
         Color.header, Color.reset,
         Color.dim,    version,
+        Color.reset,  Color.header,
+        tr(lang, "a door they can't close.", "дверь, которую им не закрыть."),
         Color.reset,
+    });
+    ui.print("  {s}{s}{s}\n\n", .{
+        Color.dim,
         tr(lang, "MTProto Proxy installer & control panel", "Установщик и панель управления MTProto Proxy"),
+        Color.reset,
     });
 
     // ── One-liner examples ──
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Quick install (one-liner)", "Быстрая установка (one-liner)"), Color.reset });
     ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "Minimal — auto-generates secret", "Минимум — секрет сгенерируется автоматически"), Color.reset });
-    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain rutube.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
     ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "Full control — bring your own secret and username", "Полный контроль — свой секрет и имя пользователя"), Color.reset });
-    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru \\\n", .{Color.bright_yellow});
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain rutube.ru \\\n", .{Color.bright_yellow});
     ui.print("    {s}  --secret <32-hex> --user alice --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
     ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "No DPI bypass (bare install)", "Без обхода DPI (чистая установка)"), Color.reset });
-    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain rutube.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
 
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Interactive wizard", "Интерактивный мастер"), Color.reset });
     ui.print("    {s}sudo mtbuddy --interactive{s}\n\n", .{ Color.bright_yellow, Color.reset });
@@ -391,7 +405,7 @@ fn printHelp(lang: i18n.Lang) void {
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Install options", "Опции установки"), Color.reset });
     printOpt(&ui, "--port,   -p <port>", tr(lang, "Proxy port (default: 443)", "Порт прокси (по умолчанию: 443)"));
     printOpt(&ui, "--public-port <port>", tr(lang, "Port advertised in Telegram links", "Порт для Telegram-ссылок"));
-    printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: wb.ru)", "TLS-домен маскировки (по умолчанию: wb.ru)"));
+    printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: rutube.ru)", "TLS-домен маскировки (по умолчанию: rutube.ru)"));
     printOpt(&ui, "--secret, -s <hex32>", tr(lang, "User secret (32 hex chars, auto-generated if omitted)", "Секрет пользователя (32 hex, если не задан — генерируется)"));
     printOpt(&ui, "--user,   -u <name>", tr(lang, "Username in config.toml (default: user)", "Имя пользователя в config.toml (по умолчанию: user)"));
     printOpt(&ui, "--config, -c <path>", tr(lang, "Use existing config.toml file", "Использовать существующий config.toml"));
@@ -399,7 +413,8 @@ fn printHelp(lang: i18n.Lang) void {
     printOpt(&ui, "--max-connections <N>", tr(lang, "Max proxy connections (default: 512)", "Максимум подключений (по умолчанию: 512)"));
     printOpt(&ui, "--no-masking", tr(lang, "Disable Nginx DPI masking", "Отключить DPI-маскировку через Nginx"));
     printOpt(&ui, "--no-nfqws", tr(lang, "Disable nfqws TCP desync", "Отключить nfqws TCP desync"));
-    printOpt(&ui, "--no-tcpmss", tr(lang, "Disable TCPMSS=88 clamping", "Отключить TCPMSS=88"));
+    printOpt(&ui, "--no-tcpmss", tr(lang, "Disable TCPMSS clamping", "Отключить TCPMSS-клампинг"));
+    printOpt(&ui, "--tcpmss <n>", tr(lang, "TCPMSS clamp value (default: 88)", "Значение TCPMSS-клампинга (по умолчанию: 88)"));
     printOpt(&ui, "--no-dpi", tr(lang, "Disable all DPI bypass modules", "Отключить все DPI-модули"));
     printOpt(&ui, "--bind,   -b <ip>", tr(lang, "Bind to specific IP (default: all interfaces)", "Слушать конкретный IP (по умолчанию: все интерфейсы)"));
     printOpt(&ui, "--middle-proxy", tr(lang, "Enable Telegram MiddleProxy relay", "Включить Telegram MiddleProxy relay"));

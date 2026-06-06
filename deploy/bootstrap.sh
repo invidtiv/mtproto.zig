@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash
-#   curl -fsSL .../bootstrap.sh | sudo bash -s -- install --port 443 --domain wb.ru --yes
+#   curl -fsSL .../bootstrap.sh | sudo bash -s -- install --port 443 --domain rutube.ru --yes
 #   curl -fsSL .../bootstrap.sh | sudo bash -s -- --interactive
 #
 # After bootstrap, mtbuddy lives at /usr/local/bin/mtbuddy and can be called directly.
@@ -207,9 +207,14 @@ if ! command -v mtbuddy >/dev/null 2>&1 && [ -d /usr/bin ]; then
   fi
 fi
 
-# ── run with forwarded args ───────────────────────────────────────
+# ── run with forwarded args, or point to the one next step ────────
 if [ "${#FORWARD_ARGS[@]}" -gt 0 ]; then
   exec "$INSTALL_TO" "${FORWARD_ARGS[@]}"
 else
-  "$INSTALL_TO" --help
+  printf '\n'
+  ok "mtbuddy is installed."
+  printf '\n  \033[1mOne more step — create your proxy and get a Telegram link:\033[0m\n\n'
+  printf '      \033[1msudo mtbuddy install --yes\033[0m\n\n'
+  printf '  Prefer a guided setup?   sudo mtbuddy --interactive\n'
+  printf '  See all options:         sudo mtbuddy --help\n\n'
 fi

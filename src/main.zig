@@ -339,7 +339,8 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeRaw("      | |  | | | | |  __/| | | (_) | || (_) |\n");
     writeRaw("      |_|  |_| |_| |_|   |_|  \\___/ \\__\\___/\n");
     writeRaw(R);
-    writeStdout("      {s}{s}proxy · zig edition · v{s}{s}\n\n", .{ D, white, version, R });
+    writeStdout("      {s}{s}proxy · zig edition · v{s}{s}\n", .{ D, white, version, R });
+    writeStdout("      {s}keeping your people connected{s}\n\n", .{ D, R });
 
     // ─── SERVER ─────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
@@ -398,7 +399,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
 
     // Footer
     writeRaw("\n  " ++ D ++ "──────────────────────────────────────────────────" ++ R ++ "\n");
-    writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
+    writeRaw("  " ++ B ++ cyan ++ "⏳ Your door is open. Waiting for the people you love..." ++ R ++ "\n\n");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -419,8 +420,9 @@ pub fn main(init: std.process.Init) !void {
                 \\  Defaults to 'config.toml' in the current directory.
                 \\
                 \\  Options:
-                \\    -h, --help       Show this help message and exit
-                \\    -v, --version    Show version and exit
+                \\    -h, --help            Show this help message and exit
+                \\    -v, --version         Show version and exit
+                \\    --check-config [path] Validate the config and exit (0=ok, 1=invalid)
                 \\
                 \\
             , .{});
@@ -429,6 +431,20 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             writeStderr("mtproto-proxy v" ++ version ++ "\n", .{});
             return;
+        }
+        // Config dry-run (like `nginx -t`): parse + validate, then exit with a
+        // shell-usable status. Usage: mtproto-proxy --check-config [config.toml]
+        if (std.mem.eql(u8, arg, "--check-config") or std.mem.eql(u8, arg, "--check")) {
+            const path = args.next() orelse "config.toml";
+            var check_cfg = config.Config.loadFromFile(allocator, path) catch |err| {
+                writeStderr("\x1b[1m\x1b[31m  ✗ config '{s}' is INVALID: {}\x1b[0m\n", .{ path, err });
+                std.process.exit(1);
+            };
+            defer check_cfg.deinit(allocator);
+            runtime_log.level = check_cfg.log_level;
+            check_cfg.emitWarnings();
+            writeStdout("  \x1b[32m✓\x1b[0m config '{s}' is valid ({d} user(s))\n", .{ path, check_cfg.users.count() });
+            std.process.exit(0);
         }
     }
 
@@ -472,6 +488,13 @@ pub fn main(init: std.process.Init) !void {
     var state = try proxy.ProxyState.init(allocator, cfg, config_path);
     cfg_owned_by_main = false;
     defer state.deinit();
+
+    // systemd notify/watchdog wiring (no-op when not run under systemd). The env
+    // strings are owned by the process environ and live for the whole run.
+    state.notify_socket = init.environ_map.get("NOTIFY_SOCKET");
+    if (init.environ_map.get("WATCHDOG_USEC")) |w| {
+        state.watchdog_usec = std.fmt.parseInt(u64, w, 10) catch 0;
+    }
 
     // Run the proxy
     try state.run();

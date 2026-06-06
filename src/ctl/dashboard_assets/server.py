@@ -2,6 +2,8 @@
 """MTProto Proxy Dashboard — API server."""
 
 import asyncio
+import base64
+import hmac
 import json
 import os
 import re
@@ -13,7 +15,7 @@ import subprocess
 import sys
 import shutil
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 try:
     import tomllib  # Python 3.11+
@@ -25,7 +27,7 @@ except ModuleNotFoundError:
 
 import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -139,6 +141,95 @@ def _proxy_version() -> str | None:
 
 
 app = FastAPI()
+
+# ── Dashboard authentication & hardening ─────────────────────────────────────
+# The dashboard is a ROOT-privileged control plane: it can rewrite config.toml,
+# delete WireGuard tunnels, restart the proxy, and read every MTProto user
+# secret. It is gated behind:
+#   1. HTTP Basic auth using an auto-generated 0600 token file (password = token,
+#      username ignored). With auth required, /api/stats returning secrets is
+#      only reachable by the authenticated operator who already owns them.
+#   2. Host-header pinning for loopback binds — defeats DNS-rebinding that would
+#      otherwise let a page in the operator's browser drive a 127.0.0.1 bind.
+#   3. An Origin check on state-changing requests — defeats CSRF (a cross-origin
+#      "simple" POST the browser would auto-attach Basic credentials to).
+# Default bind stays 127.0.0.1; reach it over an SSH tunnel.
+_DASHBOARD_TOKEN_FILE = Path(__file__).parent / "dashboard.token"
+
+
+def _load_or_create_dashboard_token() -> str:
+    try:
+        if _DASHBOARD_TOKEN_FILE.is_file():
+            tok = _DASHBOARD_TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if tok:
+                return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(str(_DASHBOARD_TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(tok + "\n")
+    except OSError as exc:
+        print(f"[dashboard] WARNING: could not persist auth token: {exc}", file=sys.stderr)
+    return tok
+
+
+DASHBOARD_TOKEN = _load_or_create_dashboard_token()
+_DASH_BIND_HOST = str(DASHBOARD_CFG.get("host", "127.0.0.1")).strip().lower()
+# Only pin Host for loopback binds (the DNS-rebinding scenario). If the operator
+# deliberately bound a routable address, Basic auth is the gate.
+_DASH_ENFORCE_HOST = _DASH_BIND_HOST in ("127.0.0.1", "::1", "localhost", "")
+_DASH_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _dashboard_auth_ok(authorization) -> bool:
+    if not authorization or not authorization.startswith("Basic "):
+        return False
+    try:
+        raw = base64.b64decode(authorization[6:]).decode("utf-8", "replace")
+    except Exception:
+        return False
+    _, _, pw = raw.partition(":")
+    return hmac.compare_digest(pw, DASHBOARD_TOKEN)
+
+
+def _host_hostname(host_header: str) -> str:
+    h = host_header
+    if h.startswith("["):  # [::1]:port
+        h = h[1:].split("]", 1)[0]
+    else:
+        h = h.split(":", 1)[0]
+    return h.strip().lower()
+
+
+@app.middleware("http")
+async def _dashboard_security(request: Request, call_next):
+    host_header = (request.headers.get("host") or "").strip()
+    if _DASH_ENFORCE_HOST and _host_hostname(host_header) not in _DASH_LOOPBACK_HOSTS:
+        return PlainTextResponse("forbidden host", status_code=403)
+
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and urlparse(origin).netloc != host_header:
+            return PlainTextResponse("cross-origin request blocked", status_code=403)
+
+    if not _dashboard_auth_ok(request.headers.get("authorization")):
+        return PlainTextResponse(
+            "authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="mtproto dashboard"'},
+        )
+
+    response = await call_next(request)
+    # Conservative hardening headers (no source restrictions, so the UI keeps
+    # rendering): block framing/clickjacking and MIME sniffing, drop referrers.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    return response
+
 
 _prev_net = {"ts": 0, "rx": 0, "tx": 0}
 _net_history = []
@@ -294,6 +385,33 @@ def _proxy_stats() -> dict:
         return {}
 
 
+def _proxy_listening(port: int) -> bool:
+    """True if the proxy holds a LISTEN socket on `port`.
+
+    Reads /proc/net/tcp{,6} instead of connect()-ing: a real connection would be
+    accepted and counted by the proxy (inflating Total Connections by one per poll),
+    and a loopback connect would also wrongly report 'stalled' when the proxy binds a
+    specific non-loopback bind_address. A LISTEN-state lookup avoids both. This is a
+    LOCAL check — it confirms the listener is up, not that a censor isn't blocking the
+    public port.
+    """
+    if not port:
+        return False
+    want = format(int(port), "04X")  # /proc/net/tcp local port is uppercase hex
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r") as f:
+                next(f, None)  # skip the header row
+                for line in f:
+                    parts = line.split()
+                    # parts[1] = "HEXADDR:HEXPORT", parts[3] = state (0A == LISTEN)
+                    if len(parts) > 3 and parts[3] == "0A" and parts[1].rsplit(":", 1)[-1].upper() == want:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
 def _proxy_info() -> dict:
     for proc in psutil.process_iter(["name", "create_time", "pid", "memory_info"]):
         if proc.info["name"] == "mtproto-proxy":
@@ -307,10 +425,21 @@ def _proxy_info() -> dict:
                 if proc.info["memory_info"]
                 else 0
             )
+            try:
+                listen_port = int(_load_proxy_runtime_config().get("port", 443))
+            except Exception:
+                listen_port = 443
+            listening = _proxy_listening(listen_port)
+            # Process up but the port isn't accepting → the event loop is wedged.
             return dict(
-                uptime=up, pid=proc.info["pid"], rss_mb=round(rss, 1), online=True
+                uptime=up,
+                pid=proc.info["pid"],
+                rss_mb=round(rss, 1),
+                online=True,
+                listening=listening,
+                state="online" if listening else "stalled",
             )
-    return dict(uptime="offline", pid=0, rss_mb=0, online=False)
+    return dict(uptime="offline", pid=0, rss_mb=0, online=False, listening=False, state="offline")
 
 
 _awg_cache = {"ts": 0, "data": None}
@@ -1203,6 +1332,7 @@ def _users_status() -> dict:
     domain_hex = tls_domain.encode("utf-8", errors="ignore").hex()
 
     direct_users = set(cfg.get("direct_users", set()))
+    labels = _load_labels()
     items = []
 
     users = cfg.get("users", {})
@@ -1224,6 +1354,7 @@ def _users_status() -> dict:
         items.append(
             {
                 "name": name,
+                "label": labels.get(name, ""),
                 "secret": secret_raw,
                 "direct": name in direct_users,
                 "enabled": True,
@@ -1241,6 +1372,7 @@ def _users_status() -> dict:
         items.append(
             {
                 "name": name,
+                "label": labels.get(name, ""),
                 "secret": secret_raw,
                 "direct": False,
                 "enabled": False,
@@ -1566,6 +1698,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Type=simple (NOT notify): must match the installer (release.zig / tunnel.zig).
+# Containerized systemd (Docker/LXC) often fails to deliver the sd_notify datagram,
+# which with Restart=always restart-loops a perfectly healthy proxy. Re-enable
+# Type=notify + WatchdogSec only behind container detection + ping validation.
 Type=simple
 User=mtproto
 Group=mtproto
@@ -1582,6 +1718,28 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/opt/mtproto-proxy
+
+# Syscall + kernel surface reduction (mirrors deploy/mtproto-proxy.service).
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+RemoveIPC=yes
+UMask=0077
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -2271,6 +2429,66 @@ async def api_routing_proxy_target(request: Request):
     )
 
 
+def _labels_path() -> Path:
+    """Sidecar file for human display labels (e.g. "Мама", "work 💼"). The proxy
+    never reads this — it only consumes [access.users] — so labels can be any
+    language without touching the config format the proxy parses."""
+    for p in _proxy_config_candidates():
+        if p.exists():
+            return p.parent / "user-labels.json"
+    return Path("/opt/mtproto-proxy/user-labels.json")
+
+
+def _load_labels() -> dict:
+    try:
+        with open(_labels_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_labels(labels: dict) -> None:
+    try:
+        path = _labels_path()
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(labels, f, ensure_ascii=False)
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+@app.get("/api/qr")
+async def api_qr(text: str = ""):
+    """Render a QR (SVG) for a connection link so it can be scanned from a phone.
+
+    Only ever encodes our own proxy links — this bounds the input and keeps the
+    endpoint from being a generic QR oracle. The dashboard is localhost-only.
+    """
+    text = (text or "").strip()
+    if (
+        not text
+        or len(text) > 512
+        or not (text.startswith("https://t.me/proxy") or text.startswith("tg://proxy"))
+    ):
+        return PlainTextResponse("invalid link", status_code=400)
+    try:
+        # argv list (no shell) → the link cannot inject a command.
+        out = subprocess.run(
+            ["qrencode", "-t", "SVG", "-m", "2", "-o", "-", text],
+            capture_output=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return PlainTextResponse("qrencode not installed", status_code=503)
+    except Exception:
+        return PlainTextResponse("qr render failed", status_code=503)
+    if out.returncode != 0 or not out.stdout:
+        return PlainTextResponse("qr render failed", status_code=503)
+    return Response(content=out.stdout, media_type="image/svg+xml")
+
+
 # ── User Management API ──
 
 
@@ -2282,17 +2500,11 @@ async def api_user_add(request: Request):
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
-    name = str(body.get("name", "")).strip()
-    if not name or not re.match(r"^[a-zA-Z0-9_-]+$", name):
+    raw_name = str(body.get("name", "")).strip()
+    if not raw_name or len(raw_name) > 64:
         return JSONResponse(
-            {"ok": False, "error": "invalid name (use a-z, 0-9, _, -)"}, status_code=400
-        )
-
-    # Check if user already exists
-    cfg = _load_proxy_runtime_config()
-    if name in cfg.get("users", {}):
-        return JSONResponse(
-            {"ok": False, "error": "user already exists"}, status_code=409
+            {"ok": False, "error": "name is required (max 64 characters)"},
+            status_code=400,
         )
 
     secret = str(body.get("secret", "")).strip().lower()
@@ -2304,14 +2516,34 @@ async def api_user_add(request: Request):
             status_code=400,
         )
 
-    if not _add_user_to_config(name, secret):
+    # The display name can be any language ("Мама", "work laptop"); derive a stable
+    # ASCII key for the TOML [access.users] section and keep the original as a label.
+    cfg = _load_proxy_runtime_config()
+    existing = set(cfg.get("users", {}).keys()) | set(cfg.get("disabled_users", {}).keys())
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw_name).strip("_").lower()
+    if len(slug) < 2:
+        slug = "user_" + secrets.token_hex(3)
+    key = slug
+    n = 2
+    while key in existing:
+        key = f"{slug}_{n}"
+        n += 1
+    label = raw_name if raw_name != key else ""
+
+    if not _add_user_to_config(key, secret):
         return JSONResponse(
             {"ok": False, "error": "failed to write config"}, status_code=500
         )
+    if label:
+        labels = _load_labels()
+        labels[key] = label
+        _save_labels(labels)
 
     _users_cache["ts"] = 0
     _restart_proxy()
-    return JSONResponse({"ok": True, "name": name, "secret": secret, "restarted": True})
+    return JSONResponse(
+        {"ok": True, "name": key, "label": label, "secret": secret, "restarted": True}
+    )
 
 
 @app.post("/api/users/remove")
@@ -2410,6 +2642,15 @@ def api_logs():
 
 @app.websocket("/ws/logs")
 async def ws_logs(ws: WebSocket):
+    # WebSocket upgrades bypass HTTP middleware, so enforce the same gates here as
+    # _dashboard_security: the loopback Host-pin (DNS-rebinding defense) AND Basic auth
+    # (browsers replay cached same-origin Basic credentials on the handshake).
+    if _DASH_ENFORCE_HOST and _host_hostname(ws.headers.get("host", "")) not in _DASH_LOOPBACK_HOSTS:
+        await ws.close(code=1008)
+        return
+    if not _dashboard_auth_ok(ws.headers.get("authorization")):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     _drain_to_recent()
     with _recent_lock:
@@ -2431,6 +2672,12 @@ async def ws_logs(ws: WebSocket):
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 if __name__ == "__main__":
+    print(
+        f"[dashboard] HTTP Basic auth required (username: any, password in "
+        f"{_DASHBOARD_TOKEN_FILE}). Listening on "
+        f"{DASHBOARD_CFG['host']}:{DASHBOARD_CFG['port']} — reach it over an SSH tunnel.",
+        file=sys.stderr,
+    )
     uvicorn.run(
         app, host=DASHBOARD_CFG["host"], port=DASHBOARD_CFG["port"], log_level="warning"
     )

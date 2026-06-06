@@ -14,6 +14,13 @@ const Color = tui_mod.Color;
 const SummaryLine = tui_mod.SummaryLine;
 
 const ZAPRET_DIR = "/opt/zapret";
+/// zapret is the DPI-bypass engine — it must track DPI evolution, so we clone the
+/// LATEST release tag (resolved at install time), not a frozen commit and not raw
+/// HEAD (which can be a broken mid-development commit). This is deliberately NOT a
+/// supply-chain pin like uv / the Python deps: freezing the bypass engine freezes
+/// the bypass. ZAPRET_FALLBACK_TAG is used only when the latest tag can't be
+/// resolved (e.g. offline) so the install still succeeds with a known-good release.
+const ZAPRET_FALLBACK_TAG = "v72.12";
 const SERVICE_NAME = "nfqws-mtproto";
 const NFQUEUE_NUM = "200";
 const INSTALL_DIR = "/opt/mtproto-proxy";
@@ -138,11 +145,35 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     } else {
         const cc = chooseWorkingCCompiler(ui, allocator) orelse return;
 
-        ui.step("Cloning and building zapret...");
+        // Clone the newest release tag (falls back to a known-good one offline) so
+        // the bypass engine stays current with DPI changes, while avoiding raw HEAD.
+        var tag_buf: [64]u8 = undefined;
+        var sha_buf: [64]u8 = undefined;
+        const ref = resolveLatestZapretTag(allocator, &tag_buf, &sha_buf);
+        const tag = if (ref) |rf| rf.tag else ZAPRET_FALLBACK_TAG;
+
+        var step_buf: [96]u8 = undefined;
+        ui.step(std.fmt.bufPrint(&step_buf, "Cloning and building zapret ({s})...", .{tag}) catch "Cloning and building zapret...");
         _ = sys.exec(allocator, &.{ "rm", "-rf", ZAPRET_DIR }) catch {};
         if (!runLogged(ui, allocator, &.{
-            "git", "clone", "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
+            "git", "clone", "--branch", tag, "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
         }, "Failed to clone zapret")) return;
+
+        // When we resolved the tag from the remote, verify the clone landed on the
+        // exact commit that remote advertised for it (guards against the clone
+        // returning a different commit than ls-remote saw). Built+run root-side, so
+        // refuse to build on mismatch. The offline fallback path has no SHA to check.
+        if (ref) |rf| {
+            const rev = sys.exec(allocator, &.{ "git", "-C", ZAPRET_DIR, "rev-parse", "HEAD" }) catch null;
+            if (rev) |rv| {
+                defer rv.deinit();
+                const got = std.mem.trim(u8, rv.stdout, " \t\r\n");
+                if (!std.mem.eql(u8, got, rf.sha)) {
+                    ui.fail("zapret clone commit does not match the resolved release tag — refusing to build");
+                    return;
+                }
+            }
+        }
 
         _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
         var make_cmd_buf: [128]u8 = undefined;
@@ -167,15 +198,18 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     removeNfqwsRules(allocator, ipt.iptables);
     removeNfqwsRules(allocator, ipt.ip6tables);
 
+    // --queue-bypass: if nfqws is not attached (down/crashed/failed to start),
+    // queued packets fall through to ACCEPT instead of the kernel default DROP.
+    // Without it, a stopped nfqws silently blackholes ALL proxy egress on this port.
     if (!runLogged(ui, allocator, &.{
-        ipt.iptables, "-t",          "mangle",    "-A", "OUTPUT",
-        "-p",         "tcp",         "--sport",   port, "-j",
-        "NFQUEUE",    "--queue-num", NFQUEUE_NUM,
+        ipt.iptables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "-p",         "tcp",         "--sport",   port,             "-j",
+        "NFQUEUE",    "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }, "Failed to apply IPv4 NFQUEUE rule")) return;
     _ = sys.exec(allocator, &.{
-        ipt.ip6tables, "-t",          "mangle",    "-A", "OUTPUT",
-        "-p",          "tcp",         "--sport",   port, "-j",
-        "NFQUEUE",     "--queue-num", NFQUEUE_NUM,
+        ipt.ip6tables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "-p",          "tcp",         "--sport",   port,             "-j",
+        "NFQUEUE",     "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }) catch {};
 
     if (!outputRuleContains(allocator, ipt.iptables, "NFQUEUE")) {
@@ -204,10 +238,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         \\
         \\[Service]
         \\Type=simple
-        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
-        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
-        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
-        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
+        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
         \\ExecStart={[zapret_dir]s}/nfq/nfqws \
         \\    --qnum={[queue]s} \
         \\    --dpi-desync=fake,split2 \
@@ -279,6 +313,43 @@ fn iptablesCommands() IptablesCommands {
         .iptables_save = sys.commandOrPath("iptables-save", &.{ "/usr/sbin/iptables-save", "/sbin/iptables-save" }),
         .ip6tables_save = sys.commandOrPath("ip6tables-save", &.{ "/usr/sbin/ip6tables-save", "/sbin/ip6tables-save" }),
     };
+}
+
+const ZapretRef = struct { tag: []const u8, sha: []const u8 };
+
+/// Resolve the newest zapret release tag (highest vX.Y) AND the commit it points
+/// to, from the remote without the GitHub API (works wherever `git clone` does).
+/// Returns slices into the caller buffers, or null if the remote is unreachable /
+/// no tag found (caller then falls back to a known-good tag, unverified). The tag
+/// is passed to `git clone --branch` as a distinct argv element (no shell) and is
+/// sanity-checked to a vX.Y string; the SHA lets the caller verify the clone
+/// landed on exactly the commit the remote advertised for that tag. This is a
+/// freshness-preserving consistency check, NOT a frozen pin or signature check.
+fn resolveLatestZapretTag(allocator: std.mem.Allocator, tag_buf: []u8, sha_buf: []u8) ?ZapretRef {
+    const r = sys.exec(allocator, &.{
+        "bash",                                                                                                "-c",
+        "git ls-remote --tags --refs --sort=-v:refname https://github.com/bol-van/zapret.git 'v*' | head -n1",
+    }) catch return null;
+    defer r.deinit();
+    if (r.exit_code != 0) return null;
+    // Output line: "<40-hex-sha>\trefs/tags/<tag>".
+    const line = std.mem.trim(u8, r.stdout, " \t\r\n");
+    const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return null;
+    const sha = line[0..tab];
+    if (sha.len < 7 or sha.len > sha_buf.len) return null;
+    for (sha) |ch| {
+        if (!((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'))) return null;
+    }
+    const marker = "refs/tags/";
+    const idx = std.mem.indexOf(u8, line, marker) orelse return null;
+    const tag = line[idx + marker.len ..];
+    if (tag.len == 0 or tag.len > tag_buf.len or tag[0] != 'v') return null;
+    for (tag) |ch| {
+        if (!((ch >= '0' and ch <= '9') or ch == '.' or ch == 'v')) return null;
+    }
+    @memcpy(tag_buf[0..tag.len], tag);
+    @memcpy(sha_buf[0..sha.len], sha);
+    return .{ .tag = tag_buf[0..tag.len], .sha = sha_buf[0..sha.len] };
 }
 
 fn chooseWorkingCCompiler(ui: *Tui, allocator: std.mem.Allocator) ?[]const u8 {

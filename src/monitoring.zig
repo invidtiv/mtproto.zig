@@ -112,6 +112,24 @@ fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
         writeSimpleResponse(fd, "405 Method Not Allowed", "text/plain", "method not allowed\n");
         return;
     }
+    // Liveness: event loop has ticked recently (well above the ~37ms loop wait).
+    if (isGetPath(request, "/healthz")) {
+        if (state.loopAlive(5000)) {
+            writeSimpleResponse(fd, "200 OK", "text/plain", "ok\n");
+        } else {
+            writeSimpleResponse(fd, "503 Service Unavailable", "text/plain", "event loop stalled\n");
+        }
+        return;
+    }
+    // Readiness: serving and not draining (LB/k8s drain signal).
+    if (isGetPath(request, "/readyz")) {
+        if (state.isReady()) {
+            writeSimpleResponse(fd, "200 OK", "text/plain", "ready\n");
+        } else {
+            writeSimpleResponse(fd, "503 Service Unavailable", "text/plain", "draining\n");
+        }
+        return;
+    }
     if (!isGetMetrics(request)) {
         writeSimpleResponse(fd, "404 Not Found", "text/plain", "not found\n");
         return;
@@ -177,9 +195,14 @@ fn isGetRequest(request: []const u8) bool {
 }
 
 fn isGetMetrics(request: []const u8) bool {
-    if (!std.mem.startsWith(u8, request, "GET /metrics")) return false;
-    if (request.len < "GET /metrics".len + 1) return false;
-    const next = request["GET /metrics".len];
+    return isGetPath(request, "/metrics");
+}
+
+fn isGetPath(request: []const u8, comptime path: []const u8) bool {
+    const prefix = "GET " ++ path;
+    if (!std.mem.startsWith(u8, request, prefix)) return false;
+    if (request.len <= prefix.len) return false;
+    const next = request[prefix.len];
     return next == ' ' or next == '?' or next == '\r';
 }
 
@@ -206,6 +229,13 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeCounter(writer, "mtproto_drops_handshake_budget_total", "connections dropped because handshake budget was exhausted", snapshot.drops_handshake_budget_total);
     try writeCounter(writer, "mtproto_handshake_timeouts_total", "connections dropped due to handshake timeout", snapshot.handshake_timeouts_total);
     try writeCounter(writer, "mtproto_middleproxy_fallback_total", "times middleproxy fell back to direct path", snapshot.middleproxy_fallback_total);
+    // Per-reason close breakdown (RED errors + evasion signal). A spike in
+    // tls_validation_failed / replay_detected / handshake_timeout vs baseline is
+    // how an operator sees a censor begin actively probing/blocking the node.
+    try writeMetricHeader(writer, "mtproto_connection_close_reason_total", "closed connections by reason", "counter");
+    inline for (std.meta.fields(proxy.CloseReason)) |f| {
+        try writer.print("mtproto_connection_close_reason_total{{reason=\"{s}\"}} {d}\n", .{ f.name, snapshot.close_reasons[f.value] });
+    }
     try writeCounter(writer, "mtproto_client_to_upstream_bytes_total", "bytes successfully written from client side toward upstream", snapshot.client_to_upstream_bytes_total);
     try writeCounter(writer, "mtproto_upstream_to_client_bytes_total", "bytes successfully written from upstream toward client side", snapshot.upstream_to_client_bytes_total);
     try writeGauge(writer, "mtproto_config_max_connections", "configured max_connections", snapshot.config_max_connections);

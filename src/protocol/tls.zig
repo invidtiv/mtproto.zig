@@ -138,8 +138,9 @@ pub fn buildServerHello(
     secret: []const u8,
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
+    cipher: ?u16,
 ) ![]u8 {
-    return buildServerHelloWithTemplate(allocator, &nginx_template, secret, client_digest, session_id);
+    return buildServerHelloWithTemplate(allocator, &nginx_template, secret, client_digest, session_id, cipher);
 }
 
 pub fn buildServerHelloWithTemplate(
@@ -148,6 +149,7 @@ pub fn buildServerHelloWithTemplate(
     secret: []const u8,
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
+    cipher: ?u16,
 ) ![]u8 {
     if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
 
@@ -155,6 +157,16 @@ pub fn buildServerHelloWithTemplate(
     const response = try allocator.alloc(u8, template.len);
     errdefer allocator.free(response);
     @memcpy(response, template);
+
+    // 1b. Echo a client-offered cipher suite. A real TLS server negotiates the
+    //     cipher from the ClientHello and naturally varies it; emitting a constant
+    //     0x1301 for every connection is a trivial passive JA3S/ServerHello
+    //     distinguisher. Telegram FakeTLS clients ignore the cipher (they validate
+    //     only the record framing + HMAC), so this is pure evasion upside with no
+    //     client-compat risk. Patched before the HMAC (step 4) which covers it.
+    if (cipher) |cs| {
+        std.mem.writeInt(u16, response[tmpl_cipher_offset..][0..2], cs, .big);
+    }
 
     // 2. Patch Session ID (echo from client). Template is fixed for 32-byte session IDs.
     if (session_id.len != 32) return error.BadSessionIdLength;
@@ -164,6 +176,17 @@ pub fn buildServerHelloWithTemplate(
     var x25519_key: [32]u8 = undefined;
     crypto.randomBytes(&x25519_key);
     @memcpy(response[tmpl_x25519_key_offset..][0..32], &x25519_key);
+
+    // 3b. Randomize the fake "encrypted certificate" AppData per connection.
+    //     A real TLS 1.3 server's first AppData record is AEAD ciphertext keyed
+    //     by per-connection ephemeral ECDHE, so it is never byte-identical
+    //     across connections. Reusing the template's fixed 2878-byte body lets a
+    //     passive observer correlate two connections to the same endpoint and
+    //     see a verbatim-repeating ciphertext that no genuine TLS server emits —
+    //     a passive FakeTLS distinguisher. The client never inspects this body
+    //     and the HMAC in step 4 covers it, so fresh randomness is protocol-safe.
+    //     The record length stays fixed, preserving the size fingerprint.
+    crypto.randomBytes(response[tmpl_appdata_offset..][0..fake_cert_payload_len]);
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
@@ -192,14 +215,23 @@ pub fn buildServerHelloWithTemplate(
 // 1. Extension ordering: OpenSSL sends supported_versions (0x002b) BEFORE key_share (0x0033)
 // 2. AppData size: fixed 2878 bytes (realistic Let's Encrypt ECDSA cert chain),
 //    NOT random in [1024,4096) which is an entropy fingerprint
-// 3. AppData body: deterministic pseudo-random (same across connections, like a real cert)
+// 3. AppData body: the comptime template seeds a deterministic body, but
+//    buildServerHelloWithTemplate overwrites it with fresh random bytes on every
+//    connection (a real cert record is unique per-connection AEAD ciphertext)
 
 /// Offset of Server Random field (32 bytes) — patched with HMAC at runtime
 const tmpl_random_offset: usize = 11;
 /// Offset of Session ID (32 bytes) — echoed from client at runtime
 const tmpl_session_id_offset: usize = 44;
+/// Offset of the 2-byte cipher suite — immediately after the 32-byte session_id
+/// (44 + 32). Patched at runtime with a client-offered suite.
+const tmpl_cipher_offset: usize = tmpl_session_id_offset + 32;
 /// Offset of X25519 public key (32 bytes) — filled with random at runtime
 const tmpl_x25519_key_offset: usize = 95;
+/// Offset of the fake AppData ("encrypted certificate") body — overwritten with
+/// fresh per-connection random bytes at runtime so it isn't byte-identical
+/// across connections (which would be a passive DPI distinguisher).
+const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_len;
 
 /// Fake encrypted certificate payload size.
 /// 2878 bytes matches a typical Nginx + Let's Encrypt ECDSA P-256 cert chain:
@@ -327,8 +359,9 @@ fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
     t[pos + 4] = @intCast(fake_cert_payload_len & 0xFF);
     pos += 5;
 
-    // Fill with deterministic pseudo-random bytes (SplitMix64).
-    // Looks like encrypted data to DPI, same every time like a real cert.
+    // Fill with deterministic pseudo-random bytes (SplitMix64) as a placeholder.
+    // This body is overwritten per-connection with fresh CSPRNG bytes in
+    // buildServerHelloWithTemplate; only the fixed record length matters here.
     var prng_state: u64 = seed;
     for (0..fake_cert_payload_len) |i| {
         prng_state +%= 0x9E3779B97F4A7C15;
@@ -353,6 +386,129 @@ pub fn isTlsHandshake(first_bytes: []const u8) bool {
 }
 
 /// Extract SNI from a TLS ClientHello.
+/// Return the first non-GREASE TLS 1.3 cipher suite the client offered
+/// (0x1301 AES-128-GCM / 0x1302 AES-256-GCM / 0x1303 CHACHA20), or null. Used to
+/// echo a client-offered cipher in the ServerHello instead of a constant, so the
+/// ServerHello's chosen cipher tracks the ClientHello like a real server's.
+pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return null; // ClientHello
+    pos += 4; // handshake type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > handshake.len) return null;
+    const session_id_len: usize = handshake[pos];
+    pos += 1 + session_id_len;
+    if (pos + 2 > handshake.len) return null;
+    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return null;
+    var i: usize = 0;
+    while (i + 2 <= cs_len) : (i += 2) {
+        const suite = std.mem.readInt(u16, handshake[pos + i ..][0..2], .big);
+        if ((suite & 0x0f0f) == 0x0a0a) continue; // GREASE (RFC 8701)
+        if (suite == 0x1301 or suite == 0x1302 or suite == 0x1303) return suite;
+    }
+    return null;
+}
+
+fn fpAppendStr(out: []u8, pos: usize, s: []const u8) ?usize {
+    if (pos + s.len > out.len) return null;
+    @memcpy(out[pos .. pos + s.len], s);
+    return pos + s.len;
+}
+
+fn fpAppendHexCsv(out: []u8, pos: usize, v: u16, first: *bool) ?usize {
+    var p = pos;
+    if (!first.*) p = fpAppendStr(out, p, ",") orelse return null;
+    first.* = false;
+    const s = std.fmt.bufPrint(out[p..], "{x:0>4}", .{v}) catch return null;
+    return p + s.len;
+}
+
+/// Diagnostic: summarize a client's ClientHello — the non-GREASE cipher suites it
+/// offered, its supported_groups, and the groups it sent key_shares for — into
+/// `out` (e.g. "ciphers=1301,1303 groups=11ec,001d keyshare=11ec"). Read-only; used
+/// to learn what a real client (e.g. a Telegram app behind a censor) actually
+/// presents, so the ServerHello can be matched to it instead of guessed. Returns
+/// null on a malformed/truncated hello. Bounded + panic-free (attacker input).
+pub fn formatClientHelloFingerprint(handshake: []const u8, out: []u8) ?[]const u8 {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return null; // ClientHello
+    pos += 4; // hs type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > handshake.len) return null;
+    const sid_len: usize = handshake[pos];
+    pos += 1 + sid_len;
+
+    if (pos + 2 > handshake.len) return null;
+    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return null;
+    const ciphers_start = pos;
+    const ciphers_end = pos + cs_len;
+    pos = ciphers_end;
+
+    if (pos + 1 > handshake.len) return null;
+    const comp_len: usize = handshake[pos];
+    pos += 1 + comp_len;
+
+    var groups_start: usize = 0;
+    var groups_end: usize = 0;
+    var ks_groups: [16]u16 = undefined;
+    var ks_count: usize = 0;
+    if (pos + 2 <= handshake.len) {
+        const ext_total = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+        pos += 2;
+        const ext_end = @min(pos + ext_total, handshake.len);
+        while (pos + 4 <= ext_end) {
+            const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+            const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
+            pos += 4;
+            if (pos + elen > ext_end) break;
+            if (etype == 0x000a and elen >= 2) { // supported_groups
+                const list_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+                if (2 + @as(usize, list_len) <= elen) {
+                    groups_start = pos + 2;
+                    groups_end = pos + 2 + list_len;
+                }
+            } else if (etype == 0x0033) { // key_share (client: list_len then entries)
+                var kp: usize = pos + 2;
+                const ks_end = pos + elen;
+                while (kp + 4 <= ks_end and ks_count < ks_groups.len) {
+                    ks_groups[ks_count] = std.mem.readInt(u16, handshake[kp..][0..2], .big);
+                    ks_count += 1;
+                    kp += 4 + @as(usize, std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big));
+                }
+            }
+            pos += elen;
+        }
+    }
+
+    var p: usize = 0;
+    p = fpAppendStr(out, p, "ciphers=") orelse return null;
+    var first = true;
+    var i = ciphers_start;
+    while (i + 2 <= ciphers_end) : (i += 2) {
+        const c = std.mem.readInt(u16, handshake[i..][0..2], .big);
+        if ((c & 0x0f0f) == 0x0a0a) continue; // skip GREASE
+        p = fpAppendHexCsv(out, p, c, &first) orelse return out[0..p];
+    }
+    p = fpAppendStr(out, p, " groups=") orelse return out[0..p];
+    first = true;
+    i = groups_start;
+    while (i + 2 <= groups_end) : (i += 2) {
+        p = fpAppendHexCsv(out, p, std.mem.readInt(u16, handshake[i..][0..2], .big), &first) orelse return out[0..p];
+    }
+    p = fpAppendStr(out, p, " keyshare=") orelse return out[0..p];
+    first = true;
+    for (ks_groups[0..ks_count]) |g| {
+        p = fpAppendHexCsv(out, p, g, &first) orelse return out[0..p];
+    }
+    return out[0..p];
+}
+
 pub fn extractSni(handshake: []const u8) ?[]const u8 {
     if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
 
@@ -438,6 +594,7 @@ test "buildServerHello produces valid three-record Nginx template structure" {
         &digest,
         &digest,
         &session_id,
+        null,
     );
     defer allocator.free(response);
 
@@ -506,23 +663,222 @@ test "buildServerHello produces valid three-record Nginx template structure" {
     ));
 }
 
-test "buildServerHello deterministic AppData (no random size fingerprint)" {
+test "dpi-validation: ServerHello structural invariants (JA3S regression gate)" {
+    // Hermetic DPI-detectability gate (the local part of dpi-validation-ci): drive
+    // a realistic ClientHello, generate the ServerHello, and assert the
+    // evasion-relevant structure — so any future evasion change that drifts the
+    // fingerprint fails here instead of shipping silently. (The full version also
+    // diffs JA4S/record-geometry against a live reference domain; that needs a
+    // Linux host + ja4 tooling and is tracked in ROADMAP_1.0.md.)
+    const allocator = std.testing.allocator;
+    const isGrease = struct {
+        fn f(v: u16) bool {
+            return (v & 0x0f0f) == 0x0a0a;
+        }
+    }.f;
+
+    // ClientHello offering [GREASE, TLS_CHACHA20 0x1303, TLS_AES_128 0x1301].
+    var ch: [52]u8 = undefined;
+    ch[0] = constants.tls_record_handshake;
+    ch[1] = 0x03;
+    ch[2] = 0x01;
+    ch[3] = 0x00;
+    ch[4] = 0x2f;
+    ch[5] = 0x01; // ClientHello
+    ch[6] = 0x00;
+    ch[7] = 0x00;
+    ch[8] = 0x2b;
+    ch[9] = 0x03;
+    ch[10] = 0x03;
+    @memset(ch[11..43], 0xCD);
+    ch[43] = 0x00; // session_id_len
+    ch[44] = 0x00;
+    ch[45] = 0x06; // cipher_suites_len = 6
+    ch[46] = 0x0a;
+    ch[47] = 0x0a; // GREASE (must be skipped)
+    ch[48] = 0x13;
+    ch[49] = 0x03; // CHACHA20 — the first non-GREASE TLS1.3 suite
+    ch[50] = 0x13;
+    ch[51] = 0x01;
+
+    const echoed = extractFirstTls13Cipher(&ch);
+    try std.testing.expectEqual(@as(?u16, 0x1303), echoed);
+
+    var digest = [_]u8{0x42} ** 32;
+    const session_id = [_]u8{0xA5} ** 32;
+    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id, echoed);
+    defer allocator.free(r1);
+
+    // 1. Cipher in the ServerHello TRACKS the ClientHello (not a constant 0x1301).
+    try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, r1[tmpl_cipher_offset..][0..2], .big));
+
+    // 2. Extensions: supported_versions (0x2b) THEN key_share (0x33), x25519 group.
+    const ext_supported_versions = std.mem.readInt(u16, r1[81..][0..2], .big);
+    const ext_key_share = std.mem.readInt(u16, r1[87..][0..2], .big);
+    const key_share_group = std.mem.readInt(u16, r1[91..][0..2], .big);
+    try std.testing.expectEqual(@as(u16, 0x002b), ext_supported_versions);
+    try std.testing.expectEqual(@as(u16, 0x0033), ext_key_share);
+    try std.testing.expectEqual(@as(u16, 0x001d), key_share_group); // x25519
+
+    // 3. NO GREASE in the structural fields (a real server never emits GREASE).
+    try std.testing.expect(!isGrease(std.mem.readInt(u16, r1[tmpl_cipher_offset..][0..2], .big)));
+    try std.testing.expect(!isGrease(ext_supported_versions));
+    try std.testing.expect(!isGrease(ext_key_share));
+    try std.testing.expect(!isGrease(key_share_group));
+
+    // 4. Record geometry: ServerHello(122) + CCS(6) + AppData(2878), fixed.
+    try std.testing.expectEqual(@as(u16, 122), std.mem.readInt(u16, r1[3..5], .big));
+    try std.testing.expectEqual(fake_cert_payload_len, std.mem.readInt(u16, r1[136..][0..2], .big));
+
+    // 5. Differ where a real server differs, constant where it is constant: a second
+    //    ServerHello for the same client must keep cipher/extensions/structure
+    //    identical but vary random + key_share key + AppData ciphertext.
+    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id, echoed);
+    defer allocator.free(r2);
+    // constant structural prefix: record header + handshake header up to the random
+    try std.testing.expectEqualSlices(u8, r1[0..tmpl_random_offset], r2[0..tmpl_random_offset]);
+    // constant cipher + extension block (session_id..key_share group)
+    try std.testing.expectEqualSlices(u8, r1[tmpl_cipher_offset..tmpl_x25519_key_offset], r2[tmpl_cipher_offset..tmpl_x25519_key_offset]);
+    // variable: server-random (HMAC), x25519 key, AppData body
+    try std.testing.expect(!std.mem.eql(u8, r1[tmpl_random_offset..][0..32], r2[tmpl_random_offset..][0..32]));
+    try std.testing.expect(!std.mem.eql(u8, r1[tmpl_x25519_key_offset..][0..32], r2[tmpl_x25519_key_offset..][0..32]));
+    try std.testing.expect(!std.mem.eql(u8, r1[tmpl_appdata_offset..][0..fake_cert_payload_len], r2[tmpl_appdata_offset..][0..fake_cert_payload_len]));
+}
+
+test "buildServerHello AppData: fixed length, per-connection-random body" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0xAA} ** 32;
     const session_id = [_]u8{0xBB} ** 32;
 
-    // Build two responses — AppData body should be identical (deterministic template)
-    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id);
+    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id, null);
     defer allocator.free(r1);
-    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id);
+    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id, null);
     defer allocator.free(r2);
 
-    // Same total size (fixed template)
+    // Same total size (fixed-length cert record — no random *size* fingerprint).
     try std.testing.expectEqual(r1.len, r2.len);
 
-    // AppData bodies are identical (deterministic PRNG, same "certificate" every time)
+    // AppData body MUST differ across connections: a real TLS 1.3 server's first
+    // AppData record is unique per-connection AEAD ciphertext, so a byte-identical
+    // body would be a passive DPI distinguisher.
     const app_offset = 127 + 6 + 5; // after ServerHello + CCS + AppData header
-    try std.testing.expectEqualSlices(u8, r1[app_offset..], r2[app_offset..]);
+    try std.testing.expect(!std.mem.eql(u8, r1[app_offset..], r2[app_offset..]));
+}
+
+test "fuzz: TLS ClientHello parsers never panic on arbitrary input" {
+    // Coverage-guided under `zig build test --fuzz`; runs deterministically as a
+    // normal unit test otherwise. Asserts the attacker-reachable FakeTLS parsers
+    // tolerate any byte sequence without a panic/OOB (a parser panic = remote DoS).
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, s: *std.testing.Smith) anyerror!void {
+            var buf: [4096]u8 = undefined;
+            const data = buf[0..s.slice(&buf)];
+            _ = extractSni(data);
+            _ = extractFirstTls13Cipher(data);
+            var fp_buf: [256]u8 = undefined;
+            _ = formatClientHelloFingerprint(data, &fp_buf);
+            const secrets = [_]UserSecret{.{ .name = "u", .secret = [_]u8{0x11} ** 16 }};
+            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true) catch {};
+        }
+    }.one, .{});
+}
+
+test "formatClientHelloFingerprint summarizes ciphers/groups/keyshare" {
+    // Hand-built ClientHello: ciphers [1301,1303], supported_groups [001d,11ec],
+    // one key_share for 001d (x25519). Verifies we can read what a real client
+    // offers (incl. whether it offers X25519MLKEM768 0x11ec).
+    var ch: [106]u8 = undefined;
+    var n: usize = 0;
+    const W = struct {
+        fn b(buf: []u8, i: *usize, v: u8) void {
+            buf[i.*] = v;
+            i.* += 1;
+        }
+        fn h(buf: []u8, i: *usize, v: u16) void {
+            std.mem.writeInt(u16, buf[i.*..][0..2], v, .big);
+            i.* += 2;
+        }
+    };
+    W.b(&ch, &n, 0x16);
+    W.b(&ch, &n, 0x03);
+    W.b(&ch, &n, 0x01);
+    W.h(&ch, &n, 101); // record len
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0x00);
+    W.h(&ch, &n, 97); // hs type + 24-bit len
+    W.h(&ch, &n, 0x0303); // version
+    var r: usize = 0;
+    while (r < 32) : (r += 1) W.b(&ch, &n, 0xAA); // random
+    W.b(&ch, &n, 0x00); // session_id len
+    W.h(&ch, &n, 4); // cipher_suites len
+    W.h(&ch, &n, 0x1301);
+    W.h(&ch, &n, 0x1303);
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0x00); // compression
+    W.h(&ch, &n, 52); // ext_total
+    W.h(&ch, &n, 0x000a);
+    W.h(&ch, &n, 6);
+    W.h(&ch, &n, 4);
+    W.h(&ch, &n, 0x001d);
+    W.h(&ch, &n, 0x11ec); // supported_groups
+    W.h(&ch, &n, 0x0033);
+    W.h(&ch, &n, 38);
+    W.h(&ch, &n, 36);
+    W.h(&ch, &n, 0x001d);
+    W.h(&ch, &n, 32); // key_share entry
+    var k: usize = 0;
+    while (k < 32) : (k += 1) W.b(&ch, &n, 0xBB); // key
+    try std.testing.expectEqual(@as(usize, 106), n);
+
+    var out: [256]u8 = undefined;
+    const fp = formatClientHelloFingerprint(&ch, &out).?;
+    try std.testing.expectEqualStrings("ciphers=1301,1303 groups=001d,11ec keyshare=001d", fp);
+    // Truncated input never panics.
+    try std.testing.expect(formatClientHelloFingerprint(ch[0..30], &out) == null);
+}
+
+test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
+    // Minimal ClientHello: record hdr, hs hdr, version, 32-byte random,
+    // session_id_len=0, cipher_suites_len=6 = [GREASE 0x0a0a, 0x1303, 0x1301].
+    var ch: [52]u8 = undefined;
+    ch[0] = 0x16;
+    ch[1] = 0x03;
+    ch[2] = 0x01;
+    ch[3] = 0x00;
+    ch[4] = 0x2f;
+    ch[5] = 0x01; // ClientHello
+    ch[6] = 0x00;
+    ch[7] = 0x00;
+    ch[8] = 0x2b;
+    ch[9] = 0x03;
+    ch[10] = 0x03; // version
+    @memset(ch[11..43], 0xAB); // random
+    ch[43] = 0x00; // session_id_len
+    ch[44] = 0x00;
+    ch[45] = 0x06; // cipher_suites_len
+    ch[46] = 0x0a;
+    ch[47] = 0x0a; // GREASE
+    ch[48] = 0x13;
+    ch[49] = 0x03; // CHACHA20
+    ch[50] = 0x13;
+    ch[51] = 0x01; // AES-128-GCM
+    try std.testing.expectEqual(@as(?u16, 0x1303), extractFirstTls13Cipher(&ch));
+    try std.testing.expect(extractFirstTls13Cipher(ch[0..40]) == null); // truncated
+}
+
+test "buildServerHello echoes the chosen cipher at the cipher offset" {
+    const allocator = std.testing.allocator;
+    var digest = [_]u8{0xAA} ** 32;
+    const session_id = [_]u8{0xBB} ** 32;
+    const resp = try buildServerHello(allocator, &digest, &digest, &session_id, 0x1303);
+    defer allocator.free(resp);
+    try std.testing.expectEqual(@as(u8, 0x13), resp[tmpl_cipher_offset]);
+    try std.testing.expectEqual(@as(u8, 0x03), resp[tmpl_cipher_offset + 1]);
+    // Default (null) keeps the template's 0x1301.
+    const resp2 = try buildServerHello(allocator, &digest, &digest, &session_id, null);
+    defer allocator.free(resp2);
+    try std.testing.expectEqual(@as(u8, 0x13), resp2[tmpl_cipher_offset]);
+    try std.testing.expectEqual(@as(u8, 0x01), resp2[tmpl_cipher_offset + 1]);
 }
 
 test "buildServerHello rejects non-32-byte session id" {
@@ -532,7 +888,7 @@ test "buildServerHello rejects non-32-byte session id" {
 
     try std.testing.expectError(
         error.BadSessionIdLength,
-        buildServerHello(allocator, &digest, &digest, &session_id),
+        buildServerHello(allocator, &digest, &digest, &session_id, null),
     );
 }
 

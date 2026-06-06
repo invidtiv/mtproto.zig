@@ -4,8 +4,8 @@
 //! Downloads pre-built release artifacts from GitHub (same path as update).
 //!
 //! One-liner usage:
-//!   sudo mtbuddy install --port 443 --domain wb.ru --yes
-//!   sudo mtbuddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --secret <hex> --user myuser --yes
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -29,9 +29,15 @@ pub const InstallOpts = struct {
     public_port: ?u16 = null,
     /// Bind to a specific IP address instead of all interfaces.
     bind_address: ?[]const u8 = null,
-    tls_domain: []const u8 = "wb.ru",
+    tls_domain: []const u8 = "rutube.ru",
     max_connections: u32 = 512,
     enable_tcpmss: bool = true,
+    /// TCPMSS --set-mss value on the SYN,ACK: forces the client's ClientHello to be
+    /// fragmented across TCP segments so the signatured extensions don't sit in one
+    /// packet for a stateless JA4 extractor. Default 88 (the long-deployed value);
+    /// configurable because 88 is itself anomalous vs the real ~1380 distribution —
+    /// retune empirically (segment boundary before ALPN/sig_algs) per host/ISP.
+    tcpmss_value: u16 = 88,
     enable_masking: bool = true,
     enable_nfqws: bool = true,
     enable_ipv6_hop: bool = false,
@@ -58,13 +64,63 @@ pub const InstallOpts = struct {
     domain_provided: bool = false,
 };
 
+fn isInstallHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+fn shouldWarnIgnoredSecret(config_exists: bool, secret_provided: bool, config_path_provided: bool) bool {
+    return config_exists and secret_provided and !config_path_provided;
+}
+
+fn printInstallHelp(ui: *Tui) void {
+    ui.writeRaw("\n");
+    ui.writeRaw("  mtbuddy install [options]\n\n");
+    ui.writeRaw("  Options:\n");
+    ui.writeRaw("    --port, -p <port>          Listen port (default: 443)\n");
+    ui.writeRaw("    --public-port <port>       Port shown in client links\n");
+    ui.writeRaw("    --domain, -d <domain>      FakeTLS masking domain (default: rutube.ru)\n");
+    ui.writeRaw("    --secret, -s <32-hex>      Initial user secret for a new config\n");
+    ui.writeRaw("    --user, -u <name>          Initial user name for a new config\n");
+    ui.writeRaw("    --config, -c <path>        Install using an existing config.toml\n");
+    ui.writeRaw("    --max-connections <N>      Max concurrent client connections (default: 512)\n");
+    ui.writeRaw("    --middle-proxy             Enable Telegram MiddleProxy relay\n");
+    ui.writeRaw("    --no-dpi                   Disable masking, nfqws, and TCPMSS setup\n");
+    ui.writeRaw("    --no-masking               Disable local masking setup\n");
+    ui.writeRaw("    --no-nfqws                 Disable nfqws setup\n");
+    ui.writeRaw("    --no-tcpmss                Disable TCPMSS setup\n");
+    ui.writeRaw("    --tcpmss <n>               TCPMSS clamp value (default 88; forces ClientHello fragmentation)\n");
+    ui.writeRaw("    --bind, -b <ip>            Bind proxy to a specific local address\n");
+    ui.writeRaw("    --ipv6-hop                 Reminder to configure IPv6 auto-hopping (needs Cloudflare API; run `mtbuddy ipv6-hop`)\n");
+    ui.writeRaw("    --version, -v <tag>        Install a specific release tag\n");
+    ui.writeRaw("    --insecure                 Disable release signature verification\n");
+    ui.writeRaw("    --yes, -y                  Run non-interactively\n");
+    ui.writeRaw("    --help, -h                 Show this help\n\n");
+    ui.writeRaw("  Note: --secret and --user only seed a new config. Existing configs are preserved.\n\n");
+}
+
+test "install - help flags are recognized before installation work" {
+    try std.testing.expect(isInstallHelpFlag("--help"));
+    try std.testing.expect(isInstallHelpFlag("-h"));
+    try std.testing.expect(!isInstallHelpFlag("--yes"));
+}
+
+test "install - explicit secret warning only applies when existing config keeps old users" {
+    try std.testing.expect(shouldWarnIgnoredSecret(true, true, false));
+    try std.testing.expect(!shouldWarnIgnoredSecret(false, true, false));
+    try std.testing.expect(!shouldWarnIgnoredSecret(true, false, false));
+    try std.testing.expect(!shouldWarnIgnoredSecret(true, true, true));
+}
+
 /// Run install in CLI (non-interactive) mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = InstallOpts{};
 
     // Parse CLI flags
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+        if (isInstallHelpFlag(arg)) {
+            printInstallHelp(ui);
+            return;
+        } else if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             if (args.next()) |val| {
                 opts.port = std.fmt.parseInt(u16, val, 10) catch 443;
                 opts.port_provided = true;
@@ -90,11 +146,14 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             if (args.next()) |val| opts.max_connections = std.fmt.parseInt(u32, val, 10) catch 512;
         } else if (std.mem.eql(u8, arg, "--secret") or std.mem.eql(u8, arg, "-s")) {
             if (args.next()) |val| {
-                if (val.len == 32) {
+                if (isValidSecretHex(val)) {
                     var sec: [32]u8 = undefined;
                     @memcpy(&sec, val[0..32]);
                     opts.secret = sec;
                 } else {
+                    // Validate hex, not just length: a 32-char non-hex secret
+                    // would be written verbatim and then fail to parse at proxy
+                    // startup with a confusing error.
                     ui.warn("--secret must be exactly 32 hex characters, ignoring");
                 }
             }
@@ -108,6 +167,14 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.enable_nfqws = false;
         } else if (std.mem.eql(u8, arg, "--no-tcpmss")) {
             opts.enable_tcpmss = false;
+        } else if (std.mem.eql(u8, arg, "--tcpmss")) {
+            if (args.next()) |val| {
+                if (std.fmt.parseInt(u16, val, 10)) |n| {
+                    if (n >= 40) opts.tcpmss_value = n else ui.warn("--tcpmss must be >= 40, keeping default 88");
+                } else |_| {
+                    ui.warn("--tcpmss must be a number, keeping default 88");
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--no-dpi")) {
             // Disable all DPI bypass modules at once
             opts.enable_masking = false;
@@ -170,7 +237,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
         ui.print("  {s}Middle:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_middle_proxy) "enabled" else "disabled" });
         ui.writeRaw("\n");
 
-        if (!try ui.confirm("Proceed with installation?", true)) {
+        if (!try ui.confirm(localized(ui, "Proceed with installation?", "Начать установку?"), true)) {
             ui.info(ui.str(.aborting));
             return;
         }
@@ -200,7 +267,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     const domain = try ui.input(
         ui.str(.install_domain_prompt),
         ui.str(.install_domain_help),
-        "wb.ru",
+        "rutube.ru",
         &domain_buf,
     );
     opts.tls_domain = domain;
@@ -217,7 +284,10 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         );
 
         if (std.mem.eql(u8, sec_str, "auto") or sec_str.len == 0) {
-            sys.generateSecret(&secret_hex);
+            sys.generateSecret(&secret_hex) catch {
+                ui.fail(ui.str(.install_secret_gen_failed));
+                return;
+            };
             ui.writeRaw("\n");
             ui.print("  {s}🔐{s} {s}: {s}{s}{s}\n", .{
                 Color.bright_yellow,
@@ -228,42 +298,59 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
                 Color.reset,
             });
             break;
-        } else if (sec_str.len == 32) {
+        } else if (isValidSecretHex(sec_str)) {
             @memcpy(&secret_hex, sec_str[0..32]);
             break;
         } else {
-            ui.print("  {s}✗ Secret must be exactly 32 hex characters, or 'auto'{s}\n", .{ Color.err, Color.reset });
+            ui.print("  {s}✗ {s}{s}\n", .{ Color.err, localized(ui, "Secret must be exactly 32 hex characters, or 'auto'", "Секрет должен быть ровно 32 hex-символа или 'auto'"), Color.reset });
         }
     }
 
-    // DPI modules — checkbox selection
-    const dpi_result = try ui.checkboxes(
-        ui.str(.install_dpi_header),
-        &.{
-            ui.str(.install_dpi_tcpmss),
-            ui.str(.install_dpi_masking),
-            ui.str(.install_dpi_nfqws),
-            ui.str(.install_dpi_desync),
-            ui.str(.install_dpi_drs),
-            ui.str(.install_dpi_ipv6),
-        },
-        &.{
-            ui.str(.install_dpi_tcpmss_help),
-            ui.str(.install_dpi_masking_help),
-            ui.str(.install_dpi_nfqws_help),
-            ui.str(.install_dpi_desync_help),
-            ui.str(.install_dpi_drs_help),
-            ui.str(.install_dpi_ipv6_help),
-        },
-        &.{ true, true, true, true, false, false },
+    // Protection against blocking. Most people should just accept the recommended
+    // defaults — so ask one friendly yes/no, and only reveal the six expert
+    // checkboxes to those who deliberately choose "Advanced".
+    const use_recommended = try ui.confirm(
+        localized(ui, "Turn on recommended protection against blocking? (recommended)", "Включить рекомендуемую защиту от блокировок? (рекомендуется)"),
+        true,
     );
+    if (use_recommended) {
+        // The shields that hide the proxy from blocking systems, on by default.
+        opts.enable_tcpmss = true;
+        opts.enable_masking = true;
+        opts.enable_nfqws = true;
+        opts.enable_desync = true;
+        opts.enable_drs = false;
+        opts.enable_ipv6_hop = false;
+    } else {
+        // Advanced: the granular six-checkbox view for people who want it.
+        const dpi_result = try ui.checkboxes(
+            ui.str(.install_dpi_header),
+            &.{
+                ui.str(.install_dpi_tcpmss),
+                ui.str(.install_dpi_masking),
+                ui.str(.install_dpi_nfqws),
+                ui.str(.install_dpi_desync),
+                ui.str(.install_dpi_drs),
+                ui.str(.install_dpi_ipv6),
+            },
+            &.{
+                ui.str(.install_dpi_tcpmss_help),
+                ui.str(.install_dpi_masking_help),
+                ui.str(.install_dpi_nfqws_help),
+                ui.str(.install_dpi_desync_help),
+                ui.str(.install_dpi_drs_help),
+                ui.str(.install_dpi_ipv6_help),
+            },
+            &.{ true, true, true, true, false, false },
+        );
 
-    opts.enable_tcpmss = (dpi_result & 1) != 0;
-    opts.enable_masking = (dpi_result & 2) != 0;
-    opts.enable_nfqws = (dpi_result & 4) != 0;
-    opts.enable_desync = (dpi_result & 8) != 0;
-    opts.enable_drs = (dpi_result & 16) != 0;
-    opts.enable_ipv6_hop = (dpi_result & 32) != 0;
+        opts.enable_tcpmss = (dpi_result & 1) != 0;
+        opts.enable_masking = (dpi_result & 2) != 0;
+        opts.enable_nfqws = (dpi_result & 4) != 0;
+        opts.enable_desync = (dpi_result & 8) != 0;
+        opts.enable_drs = (dpi_result & 16) != 0;
+        opts.enable_ipv6_hop = (dpi_result & 32) != 0;
+    }
     opts.secret = secret_hex;
 
     // MiddleProxy toggle
@@ -305,6 +392,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.fail(ui.str(.error_not_root));
         return;
     }
+
+    // Warn NOW (before the link — which embeds tls_domain — is generated and frozen)
+    // if the fronting domain is a poor FakeTLS mimicry target.
+    warnIfPoorFrontingDomain(ui, allocator, opts.tls_domain);
 
     // ── Check port / masking collision ──
     // The masking Nginx binds to 127.0.0.1:8443. If the proxy listens on
@@ -363,6 +454,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
                 "tar",                     "passwd",
             };
         if (!runRequiredWhileSpinning(ui, allocator, base_packages, "Failed to install system dependencies", &sp)) return;
+        // qrencode powers the optional terminal/dashboard QR; the feature degrades
+        // gracefully without it (printQrCode no-ops), so install it best-effort and
+        // never fail the whole install if it's unavailable.
+        _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "--no-install-recommends", "qrencode" }) catch {};
         if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
             sp.stop(false, "");
             ui.fail("minisign is required for release signature verification");
@@ -415,7 +510,19 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     // ── Copy user config (if provided) ──
     if (opts.config_path) |cfg_path| {
-        _ = sys.exec(allocator, &.{ "cp", cfg_path, INSTALL_DIR ++ "/config.toml" }) catch {};
+        const cp = sys.exec(allocator, &.{ "cp", cfg_path, INSTALL_DIR ++ "/config.toml" }) catch {
+            ui.fail("Failed to copy --config file into the install dir");
+            return;
+        };
+        defer cp.deinit();
+        if (cp.exit_code != 0) {
+            // Do NOT fall through to generating a fresh config with a different
+            // secret — that would silently discard the operator's intended users.
+            ui.fail("Failed to copy --config file into the install dir");
+            return;
+        }
+        // The supplied config holds secrets; restrict it (cp preserves source mode).
+        _ = sys.exec(allocator, &.{ "chmod", "0640", INSTALL_DIR ++ "/config.toml" }) catch {};
     }
 
     // ── Generate config ──
@@ -425,7 +532,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         if (opts.secret) |s| {
             secret_hex = s;
         } else {
-            sys.generateSecret(&secret_hex);
+            sys.generateSecret(&secret_hex) catch {
+                ui.fail(ui.str(.install_secret_gen_failed));
+                return;
+            };
         }
 
         const user_name = opts.user orelse "user";
@@ -445,7 +555,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         if (opts.bind_address) |ba| {
             try doc.addKvStr("bind_address", ba);
         }
-        try doc.addKv("max_connections", "512");
+        var max_conn_buf: [16]u8 = undefined;
+        const max_conn_val = std.fmt.bufPrint(&max_conn_buf, "{d}", .{opts.max_connections}) catch "512";
+        try doc.addKv("max_connections", max_conn_val);
         try doc.addKv("idle_timeout_sec", "120");
         try doc.addKv("handshake_timeout_sec", "15");
         try doc.addKv("handshake_flood_guard_enabled", "true");
@@ -473,6 +585,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.ok(ui.str(.install_config_generated));
     } else {
         ui.ok(ui.str(.install_config_exists));
+        if (shouldWarnIgnoredSecret(true, opts.secret != null, opts.config_path != null)) {
+            ui.warn(ui.str(.install_warn_secret_ignored));
+        }
+        if (opts.user != null and opts.config_path == null) {
+            ui.warn(ui.str(.install_warn_user_ignored));
+        }
     }
 
     // ── Create system user/group ──
@@ -495,6 +613,23 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.stop(true, "");
     }
 
+    // The proxy is already live and usable here — show the link NOW, before the
+    // optional (and slow, from-source) masking + zapret steps, so the "aha" moment
+    // lands in seconds instead of after a multi-minute compile. The final summary
+    // below reprints it together with the protection status.
+    var resolved_server_buf: [256]u8 = undefined;
+    const resolved_server = resolvePublicServer(ui, allocator, config_path_buf, &resolved_server_buf);
+    {
+        ui.writeRaw("\n");
+        ui.ok(localized(ui, "Your proxy is LIVE — here's your link:", "Прокси ЗАПУЩЕН — вот ваша ссылка:"));
+        ui.print("  {s}╭─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
+        _ = printLinksFromConfig(ui, allocator, resolved_server, opts.public_port orelse opts.port, opts.tls_domain, config_path_buf, true);
+        ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
+        if (opts.enable_masking or opts.enable_nfqws) {
+            ui.info(localized(ui, "Now turning on extra anti-blocking protection — the link above already works...", "Теперь включаю дополнительную защиту от блокировок — ссылка выше уже работает..."));
+        }
+    }
+
     // ── Firewall ──
     if (sys.commandExists("ufw")) {
         var port_str_buf: [8]u8 = undefined;
@@ -507,18 +642,20 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     if (opts.enable_tcpmss) {
         var port_str_buf: [8]u8 = undefined;
         const port_str = std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port}) catch "443";
+        var mss_str_buf: [8]u8 = undefined;
+        const mss_str = std.fmt.bufPrint(&mss_str_buf, "{d}", .{opts.tcpmss_value}) catch "88";
 
         _ = sys.exec(allocator, &.{
             "iptables", "-t",      "mangle",  "-A",     "OUTPUT",
             "-p",       "tcp",     "--sport", port_str, "--tcp-flags",
             "SYN,ACK",  "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            "88",
+            mss_str,
         }) catch {};
         _ = sys.exec(allocator, &.{
             "ip6tables", "-t",      "mangle",  "-A",     "OUTPUT",
             "-p",        "tcp",     "--sport", port_str, "--tcp-flags",
             "SYN,ACK",   "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            "88",
+            mss_str,
         }) catch {};
         _ = sys.exec(allocator, &.{
             "bash",                                                                                                        "-c",
@@ -528,6 +665,13 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.ok(ui.str(.install_tcpmss_ok));
     }
 
+    // IPv6 auto-hopping cannot be configured here (it needs Cloudflare API
+    // credentials). Surface a clear reminder instead of silently ignoring the
+    // flag / wizard toggle, so the documented option is no longer a no-op.
+    if (opts.enable_ipv6_hop) {
+        ui.warn(ui.str(.install_warn_ipv6_hop_manual));
+    }
+
     var summary_opts = opts;
 
     // ── Masking (via Zig module) ──
@@ -535,7 +679,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         masking.execute(ui, allocator, .{ .tls_domain = opts.tls_domain }) catch {
             ui.warn("Masking setup failed");
         };
-        summary_opts.enable_masking = sys.fileExists("/etc/nginx/sites-enabled/mtproto-masking") and sys.isServiceActive("nginx");
+        // Source of truth is the config (mask=true), not a local nginx site: the
+        // secure real-domain-fronting path enables masking WITHOUT a local nginx,
+        // and was previously mis-reported as "masking disabled".
+        summary_opts.enable_masking = configMaskEnabled(allocator);
         if (!summary_opts.enable_masking) {
             ui.warn("Masking setup did not complete; final summary will show it disabled.");
         }
@@ -564,10 +711,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     ui.rule();
 
     // ── Print summary ──
-    var sp = ui.spinner("Detecting public IP");
-    sp.start();
-    const public_ip = sys.detectPublicIp(allocator) orelse "<SERVER_IP>";
-    sp.stop(true, public_ip);
+    // The public server was already resolved once (resolved_server: configured
+    // [server].public_ip preferred, else auto-detected) and reused here, so the
+    // early link/QR and the summary agree and detection runs only once. The
+    // SERVER_IP placeholder => printSummary warns the operator to replace it.
+    const public_ip = resolved_server;
 
     // Read summary values from active config
     var summary_server: []const u8 = public_ip;
@@ -659,6 +807,23 @@ fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) [
     return ee_buf[0..ee_pos];
 }
 
+fn buildDdSecret(secret: []const u8, dd_buf: []u8) []const u8 {
+    var pos: usize = 0;
+    @memcpy(dd_buf[pos..][0..2], "dd");
+    pos += 2;
+
+    var clean_secret = secret;
+    if (clean_secret.len >= 2 and clean_secret[0] == '"' and clean_secret[clean_secret.len - 1] == '"') {
+        clean_secret = clean_secret[1 .. clean_secret.len - 1];
+    }
+
+    const sec_len = @min(clean_secret.len, dd_buf.len - pos);
+    @memcpy(dd_buf[pos..][0..sec_len], clean_secret[0..sec_len]);
+    pos += sec_len;
+
+    return dd_buf[0..pos];
+}
+
 fn stripInlineComment(value: []const u8) []const u8 {
     var in_quotes = false;
     var comment_pos: ?usize = null;
@@ -714,6 +879,19 @@ fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
     return out[0..pos];
 }
 
+/// Render a scannable QR of `text` to the terminal via qrencode (UTF8 half-blocks).
+/// Best-effort: a silent no-op when qrencode is unavailable. Lets the operator scan
+/// the link straight from an SSH session onto a phone — or show it to a relative.
+fn printQrCode(ui: *Tui, allocator: std.mem.Allocator, text: []const u8) void {
+    if (!sys.commandExists("qrencode")) return;
+    const r = sys.exec(allocator, &.{ "qrencode", "-t", "UTF8", "-m", "1", text }) catch return;
+    defer r.deinit();
+    if (r.stdout.len == 0) return;
+    ui.writeRaw("\n");
+    ui.hint(localized(ui, "Scan to connect a device:", "Отсканируйте, чтобы подключить устройство:"));
+    ui.writeRaw(r.stdout);
+}
+
 fn printLinksFromConfig(
     ui: *Tui,
     allocator: std.mem.Allocator,
@@ -721,9 +899,19 @@ fn printLinksFromConfig(
     port: u16,
     tls_domain: []const u8,
     config_path: []const u8,
+    with_qr: bool,
 ) bool {
     var cfg_doc = toml.TomlDoc.load(allocator, config_path) catch return false;
     defer cfg_doc.deinit();
+    var qr_done = false;
+
+    // dd links only make sense when the operator enabled the dd transport
+    // (fake_tls_only = false). With the secure default the proxy rejects dd, so
+    // a dd link would be non-working and DPI-fingerprintable — don't print it.
+    const dd_enabled = if (cfg_doc.get("censorship", "fake_tls_only")) |v|
+        std.mem.eql(u8, std.mem.trim(u8, v, " \t\""), "false")
+    else
+        false;
 
     var printed_any = false;
     var in_users_section = false;
@@ -755,23 +943,63 @@ fn printLinksFromConfig(
         var encoded_ip_buf: [768]u8 = undefined;
         const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
 
-        var link_buf: [512]u8 = undefined;
-        const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+        var ee_link_buf: [512]u8 = undefined;
+        const ee_link = std.fmt.bufPrint(&ee_link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+            safe_public_ip,
+            port,
+            ee_secret,
+        }) catch continue;
+        // The t.me link is the one to SHARE — it renders a tappable "Connect proxy"
+        // card in Telegram and opens from any browser/messenger; tg:// is the direct
+        // app link.
+        var tme_link_buf: [512]u8 = undefined;
+        const tme_link = std.fmt.bufPrint(&tme_link_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
             port,
             ee_secret,
         }) catch continue;
 
-        ui.print("  {s}│{s}  {s}{s}:{s} {s}{s}{s}\n", .{
-            tui_mod.Color.gray,
-            tui_mod.Color.reset,
-            tui_mod.Color.dim,
-            user_name,
-            tui_mod.Color.reset,
-            tui_mod.Color.white,
-            link,
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{
+            tui_mod.Color.gray,  tui_mod.Color.reset,
+            tui_mod.Color.white, user_name,
             tui_mod.Color.reset,
         });
+        ui.print("  {s}│{s}    {s}{s}{s}\n", .{
+            tui_mod.Color.gray,  tui_mod.Color.reset,
+            tui_mod.Color.white, tme_link,
+            tui_mod.Color.reset,
+        });
+        ui.print("  {s}│{s}    {s}{s}{s}\n", .{
+            tui_mod.Color.gray,  tui_mod.Color.reset,
+            tui_mod.Color.dim,   ee_link,
+            tui_mod.Color.reset,
+        });
+        // A scannable QR of the share link for the first user — point a phone
+        // camera at it to connect, no copy-paste. Best-effort (needs qrencode).
+        if (with_qr and !qr_done) {
+            printQrCode(ui, allocator, tme_link);
+            qr_done = true;
+        }
+        if (dd_enabled) {
+            var dd_buf: [128]u8 = undefined;
+            const dd_secret = buildDdSecret(secret_hex, &dd_buf);
+            var dd_link_buf: [512]u8 = undefined;
+            const dd_link = std.fmt.bufPrint(&dd_link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+                safe_public_ip,
+                port,
+                dd_secret,
+            }) catch continue;
+            ui.print("  {s}│{s}  {s}{s} dd:     {s} {s}{s}{s}\n", .{
+                tui_mod.Color.gray,
+                tui_mod.Color.reset,
+                tui_mod.Color.dim,
+                user_name,
+                tui_mod.Color.reset,
+                tui_mod.Color.white,
+                dd_link,
+                tui_mod.Color.reset,
+            });
+        }
         printed_any = true;
     }
 
@@ -793,6 +1021,8 @@ fn printSummary(
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "443";
     var public_port_buf: [8]u8 = undefined;
     const public_port_str = std.fmt.bufPrint(&public_port_buf, "{d}", .{public_port}) catch "443";
+    var tcpmss_label_buf: [56]u8 = undefined;
+    const tcpmss_label = std.fmt.bufPrint(&tcpmss_label_buf, "TCPMSS={d} (ClientHello fragmentation)", .{opts.tcpmss_value}) catch "TCPMSS (ClientHello fragmentation)";
 
     ui.summaryBox(ui.str(.install_success_header), &.{
         .{ .label = ui.str(.install_status_cmd), .value = "systemctl status mtproto-proxy" },
@@ -808,7 +1038,7 @@ fn printSummary(
         .{ .label = "", .style = .blank },
         .{ .label = ui.str(.install_dpi_active), .style = .highlight },
         .{
-            .label = if (opts.enable_tcpmss) "TCPMSS=88 (ClientHello fragmentation)" else "",
+            .label = if (opts.enable_tcpmss) tcpmss_label else "",
             .style = if (opts.enable_tcpmss) .success else .blank,
         },
         .{
@@ -837,25 +1067,45 @@ fn printSummary(
     ui.writeRaw("\n");
     ui.print("  {s}╭─ {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.bold, ui.str(.install_connection_link) });
 
-    if (!printLinksFromConfig(ui, allocator, public_ip, public_port, tls_domain, config_path)) {
+    if (!printLinksFromConfig(ui, allocator, public_ip, public_port, tls_domain, config_path, false)) {
+        // Fallback when no config could be read. Fresh installs default to the
+        // secure TLS-only posture (fake_tls_only = true), so only the FakeTLS
+        // (ee) link is printed here. dd links are surfaced by printLinksFromConfig
+        // only when the operator has explicitly enabled the dd transport.
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
 
         var encoded_ip_buf: [768]u8 = undefined;
         const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
 
-        var link_buf: [512]u8 = undefined;
-        const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+        var ee_link_buf: [512]u8 = undefined;
+        const ee_link = std.fmt.bufPrint(&ee_link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
             public_port,
             ee_secret,
         }) catch "error building link";
 
-        ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, link, tui_mod.Color.reset });
+        var tme_link_buf: [512]u8 = undefined;
+        const tme_link = std.fmt.bufPrint(&tme_link_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
+            safe_public_ip,
+            public_port,
+            ee_secret,
+        }) catch ee_link;
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, tme_link, tui_mod.Color.reset });
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.dim, ee_link, tui_mod.Color.reset });
     }
 
     ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
-    ui.hint(localized(ui, "Run `sudo mtbuddy links` later to print these links again.", "Позже выполните `sudo mtbuddy links`, чтобы снова показать эти ссылки."));
+
+    if (std.mem.indexOf(u8, public_ip, "SERVER_IP") != null) {
+        ui.warn(localized(ui, "Couldn't auto-detect this server's public IP. In the links above, replace SERVER_IP with your VPS's IP address (e.g. 203.0.113.5).", "Не удалось определить публичный IP сервера. В ссылках выше замените SERVER_IP на IP-адрес вашего VPS (например, 203.0.113.5)."));
+    }
+
+    ui.writeRaw("\n");
+    ui.hint(localized(ui, "Share with someone you love — send them the top (t.me) link with:", "Поделитесь с близким — отправьте ему верхнюю (t.me) ссылку со словами:"));
+    ui.hint(localized(ui, "\"I set up a private door to Telegram for us. Tap this link, choose Connect, and Telegram will work again.\"", "«Я сделал для нас личный вход в Telegram. Нажми на ссылку, выбери «Подключить» — и Telegram снова заработает.»"));
+    ui.writeRaw("\n");
+    ui.hint(localized(ui, "Print these links again anytime: sudo mtbuddy links", "Показать эти ссылки снова в любой момент: sudo mtbuddy links"));
     ui.hint(localized(ui, "Runtime proxy logs intentionally hide secrets and links.", "Runtime-логи прокси намеренно скрывают секреты и ссылки."));
 }
 
@@ -864,6 +1114,30 @@ fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
         .en => en,
         .ru => ru,
     };
+}
+
+/// Resolve the public server address used in client links: a configured
+/// [server].public_ip wins over auto-detection (matching main.zig/links.zig/the
+/// summary). Computed once and reused for both the early "LIVE" link/QR and the
+/// final summary so they encode the SAME address and detection runs only once.
+fn resolvePublicServer(ui: *Tui, allocator: std.mem.Allocator, config_path: []const u8, out_buf: []u8) []const u8 {
+    if (toml.TomlDoc.load(allocator, config_path)) |loaded| {
+        var cfg_doc = loaded;
+        defer cfg_doc.deinit();
+        if (cfg_doc.get("server", "public_ip")) |configured| {
+            const trimmed = std.mem.trim(u8, configured, &[_]u8{ ' ', '\t' });
+            if (trimmed.len > 0) {
+                const n = @min(trimmed.len, out_buf.len);
+                @memcpy(out_buf[0..n], trimmed[0..n]);
+                return out_buf[0..n];
+            }
+        }
+    } else |_| {}
+    var ip_sp = ui.spinner("Detecting public IP");
+    ip_sp.start();
+    const ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
+    ip_sp.stop(true, ip);
+    return ip;
 }
 
 fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
@@ -929,12 +1203,60 @@ fn requiredAccountToolsAvailable(ui: *Tui) bool {
     return true;
 }
 
+/// Best-effort warning if `domain` is a poor FakeTLS fronting target. Our 3-record
+/// ServerHello (single x25519 key_share, no HelloRetryRequest) cannot mimic a domain
+/// whose genuine TLS 1.3 prefers a non-x25519 group / does an HRR — e.g. wb.ru and
+/// mail.ru pick secp521r1 and reject an x25519-only hello — producing a passive
+/// ServerHello mismatch. tls_domain is immutable once links ship, so this runs while
+/// the choice is still free. Probes via openssl; skips silently if openssl is absent.
+fn warnIfPoorFrontingDomain(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) void {
+    if (domain.len == 0 or domain.len > 253) return;
+    if (!sys.commandExists("openssl")) return;
+    // Sanitize: a real hostname is [a-z0-9.-] only, so interpolating it into the
+    // probe command below cannot inject shell metacharacters.
+    for (domain) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '-';
+        if (!ok) return;
+    }
+    ui.step("Checking fronting-domain TLS suitability...");
+    var cmd_buf: [512]u8 = undefined;
+    // Prints "Server Temp Key" iff the domain negotiates x25519 in a SINGLE round;
+    // an HRR / x25519-reject yields a handshake_failure and no temp key (exit != 0).
+    const cmd = std.fmt.bufPrint(
+        &cmd_buf,
+        "echo | timeout 10 openssl s_client -connect {s}:443 -servername {s} -groups x25519 -tls1_3 2>/dev/null | grep -q 'Server Temp Key'",
+        .{ domain, domain },
+    ) catch return;
+    const r = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch return;
+    defer r.deinit();
+    if (r.exit_code == 0) return; // good: single-round x25519
+
+    ui.warn("Could not confirm single-round x25519 for this fronting domain.");
+    var msg_buf: [320]u8 = undefined;
+    if (std.fmt.bufPrint(&msg_buf, "  '{s}' may do a HelloRetryRequest / reject x25519 (like wb.ru), or be unreachable.", .{domain}) catch null) |m| ui.warn(m);
+    ui.warn("  If so, our FakeTLS ServerHello can't match it — a passive observer sees a mismatch.");
+    ui.hint("  Prefer a domain with single-round x25519 (e.g. rutube.ru, ozon.ru, vk.com). tls_domain is IMMUTABLE once links are shared — choose now.");
+}
+
 fn commandAvailable(name: []const u8, candidates: []const []const u8) bool {
     if (sys.commandExists(name)) return true;
     for (candidates) |candidate| {
         if (sys.fileExists(candidate)) return true;
     }
     return false;
+}
+
+/// True when the installed config has masking enabled — via a local nginx backend
+/// OR real-domain fronting to tls_domain:443 (the secure default when no
+/// owned-domain cert is available, which never creates a local nginx site). The
+/// config (`mask = true`) is the source of truth; probing for an nginx site would
+/// wrongly report the real-domain-fronting path as "masking disabled".
+fn configMaskEnabled(allocator: std.mem.Allocator) bool {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return false;
+    defer doc.deinit();
+    const v = doc.get("censorship", "mask") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t\"'"), "true");
 }
 
 fn userExists(allocator: std.mem.Allocator, name: []const u8) bool {

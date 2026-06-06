@@ -163,6 +163,12 @@ pub const Config = struct {
     /// Hard cap for concurrently handled client connections
     /// Default tuned for 1 vCPU / 1 GB VPS profile.
     max_connections: u32 = 512,
+    /// Number of SO_REUSEPORT epoll worker threads. 1 (default) = the classic
+    /// single-threaded loop, behavior identical to before. 0 = auto (one per CPU,
+    /// clamped). >1 spreads the relay/crypto load across cores; the kernel
+    /// load-balances connections across workers. max_connections stays the global
+    /// total (workers share it, bounded by the saturation cap).
+    workers: u16 = 1,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
     /// Handshake read timeout after first byte arrives
@@ -172,6 +178,20 @@ pub const Config = struct {
     /// for this many seconds before forced close.
     graceful_shutdown_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
+    /// FakeTLS fronting domain (the SNI clients present).
+    ///
+    /// ⚠️ IMMUTABLE once links are distributed: the `ee` secret embeds this domain
+    /// as hex, so the tg:// link is a function of (secret, tls_domain). Changing
+    /// tls_domain changes EVERY user's link — never do it on a live deployment.
+    ///
+    /// Mimicry note: our 3-record FakeTLS emits ONE ServerHello with an x25519
+    /// key_share and cannot replicate a HelloRetryRequest. Pick a domain whose
+    /// genuine TLS 1.3 negotiates **x25519 in a single round** (most big sites:
+    /// rutube.ru, ozon.ru, vk.com, yandex.ru, dzen.ru). Domains that prefer
+    /// secp521r1 / reject x25519 and HRR (e.g. wb.ru, mail.ru) produce a passive
+    /// ServerHello mismatch that cannot be fixed without changing tls_domain —
+    /// which the immutability rule above forbids. So choose well at install time.
+    /// See ARCHITECTURE.md "FakeTLS fronting & domain selection".
     tls_domain: []const u8 = default_tls_domain,
     users: std.StringHashMap([16]u8),
     /// Users that always bypass MiddleProxy and connect to DC directly.
@@ -184,6 +204,13 @@ pub const Config = struct {
     mask_target: ?[]const u8 = null,
     /// Port used by the masking backend.
     mask_port: u16 = 443,
+    /// Reject the non-TLS "direct obfuscated" (dd / secure) transport. When true
+    /// (the default), only FakeTLS (ee) clients are accepted and any non-TLS
+    /// first bytes are masked immediately — eliminating the dd active-probe
+    /// distinguisher. This is the secure default for a TLS-camouflage proxy: dd
+    /// is plain, DPI-fingerprintable MTProto. Set to false ONLY if you need to
+    /// hand out dd links (lower-DPI / compatibility scenarios).
+    fake_tls_only: bool = true,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
     /// Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes
@@ -198,10 +225,15 @@ pub const Config = struct {
     middleproxy_buffer_kb: u32 = 1024,
     /// Runtime log level: "debug", "info" (default), "warn", "err"
     log_level: std.log.Level = .info,
-    /// Max new connections per second per /24 subnet (0 = disabled).
-    /// Limits scanner/flood/DPI-probe impact. Generous for legitimate Telegram clients
-    /// which open 3-6 connections at startup and hold them.
-    rate_limit_per_subnet: u8 = 30,
+    /// Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet
+    /// (0 = disabled, the default). Disabled by default because the target
+    /// audience sits behind heavy carrier-grade NAT where many legitimate users
+    /// share one subnet — a per-subnet new-connection cap false-positives on
+    /// exactly those users, which for a censorship-circumvention tool is worse
+    /// than the flood it prevents. Access is already gated by the per-user
+    /// secret, the global handshake-inflight budget, and max_connections. Set a
+    /// value (e.g. 30) to re-enable for single-tenant / non-NAT deployments.
+    rate_limit_per_subnet: u8 = 0,
     /// Exact-IP handshake flood guard. Temporarily denies clients that repeatedly
     /// hit handshake timeouts, subnet rate limits, or the handshake budget.
     handshake_flood_guard_enabled: bool = true,
@@ -441,15 +473,24 @@ pub const Config = struct {
                     if (value.len != 32) return error.InvalidUserSecretLength;
                     var secret: [16]u8 = undefined;
                     _ = std.fmt.hexToBytes(&secret, value) catch return error.InvalidUserSecretHex;
-                    const name = try allocator.dupe(u8, key);
-                    try cfg.users.put(name, secret);
+                    // On a duplicate user name, update the value in place and keep
+                    // the already-owned key (put with an existing key does not
+                    // retain the passed key), so we don't leak a fresh dupe.
+                    if (cfg.users.contains(key)) {
+                        try cfg.users.put(key, secret);
+                    } else {
+                        const name = try allocator.dupe(u8, key);
+                        try cfg.users.put(name, secret);
+                    }
                 } else if (in_direct_users_section) {
                     const enabled = std.mem.eql(u8, value, "true") or
                         std.mem.eql(u8, value, "1") or
                         std.mem.eql(u8, value, "yes");
                     if (!enabled) continue;
-                    const name = try allocator.dupe(u8, key);
-                    try cfg.direct_users.put(name, {});
+                    if (!cfg.direct_users.contains(key)) {
+                        const name = try allocator.dupe(u8, key);
+                        try cfg.direct_users.put(name, {});
+                    }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
                         cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
@@ -470,14 +511,20 @@ pub const Config = struct {
                     }
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
-                        cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
+                        cfg.port = std.fmt.parseInt(u16, value, 10) catch blk: {
+                            std.log.scoped(.config).warn("invalid server.port \"{s}\"; falling back to 443", .{value});
+                            break :blk 443;
+                        };
                     } else if (std.mem.eql(u8, key, "bind_address")) {
+                        if (cfg.bind_address) |prev| allocator.free(prev);
                         cfg.bind_address = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "backlog")) {
                         cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
                     } else if (std.mem.eql(u8, key, "max_connections")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.max_connections;
                         cfg.max_connections = @max(@as(u32, 32), parsed);
+                    } else if (std.mem.eql(u8, key, "workers")) {
+                        cfg.workers = std.fmt.parseInt(u16, value, 10) catch cfg.workers;
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
                         cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
@@ -496,11 +543,13 @@ pub const Config = struct {
                             } else |_| {}
                         }
                     } else if (std.mem.eql(u8, key, "public_ip")) {
+                        if (cfg.public_ip) |prev| allocator.free(prev);
                         cfg.public_ip = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "public_port")) {
                         const parsed = std.fmt.parseInt(u16, value, 10) catch 0;
                         if (parsed > 0) cfg.public_port = parsed;
                     } else if (std.mem.eql(u8, key, "middle_proxy_nat_ip")) {
+                        if (cfg.middle_proxy_nat_ip) |prev| allocator.free(prev);
                         cfg.middle_proxy_nat_ip = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
@@ -535,6 +584,15 @@ pub const Config = struct {
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
+                        // The top-level empty-value guard runs BEFORE quote
+                        // stripping, so `tls_domain = ""` reaches here as an empty
+                        // string. An empty FakeTLS domain silently breaks SNI
+                        // matching and masking — reject it loudly instead.
+                        if (value.len == 0) return error.EmptyTlsDomain;
+                        // Free the previous heap dupe (but never the compile-time
+                        // default) before overwriting, so a duplicate tls_domain
+                        // key does not leak.
+                        if (cfg.tls_domain.ptr != default_tls_domain.ptr) allocator.free(cfg.tls_domain);
                         cfg.tls_domain = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = std.mem.eql(u8, value, "true");
@@ -545,6 +603,8 @@ pub const Config = struct {
                         cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         cfg.desync = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "fake_tls_only")) {
+                        cfg.fake_tls_only = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "drs")) {
                         cfg.drs = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
@@ -582,6 +642,7 @@ pub const Config = struct {
                     }
                 } else if (in_upstream_tunnel_section) {
                     if (std.mem.eql(u8, key, "interface")) {
+                        if (cfg.upstream_tunnel_interface) |prev| allocator.free(prev);
                         cfg.upstream_tunnel_interface = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "interfaces")) {
                         freeStringSlice(allocator, cfg.upstream_tunnel_interfaces);
@@ -733,9 +794,10 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expect(!cfg.fast_mode); // Default is false
+    try std.testing.expect(cfg.fake_tls_only); // Default is true (secure: dd off)
     try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
-    try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
+    try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet); // Default 0 (disabled)
     try std.testing.expect(cfg.handshake_flood_guard_enabled);
     try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
     try std.testing.expectEqual(@as(u16, 30), cfg.handshake_flood_guard_window_sec);
@@ -1299,7 +1361,7 @@ test "parse config - invalid rate_limit keeps default" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
+    try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet);
 }
 
 test "parse config - censorship section booleans" {
@@ -1643,6 +1705,77 @@ test "parse config - duplicate upstream proxy fields" {
     try std.testing.expectEqualStrings("10.0.0.2", cfg.upstream_proxy_host.?);
     try std.testing.expectEqualStrings("second", cfg.upstream_proxy_username.?);
     try std.testing.expectEqualStrings("two", cfg.upstream_proxy_password.?);
+}
+
+test "parse config - fake_tls_only defaults true (secure) and parses false" {
+    var default_cfg = try Config.parse(std.testing.allocator,
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer default_cfg.deinit(std.testing.allocator);
+    try std.testing.expect(default_cfg.fake_tls_only);
+
+    var cfg = try Config.parse(std.testing.allocator,
+        \\[censorship]
+        \\fake_tls_only = false
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(!cfg.fake_tls_only);
+}
+
+test "parse config - rate_limit_per_subnet defaults to 0 (disabled)" {
+    var cfg = try Config.parse(std.testing.allocator,
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - workers defaults to 1 (single-threaded) and parses" {
+    var cfg_default = try Config.parse(std.testing.allocator,
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg_default.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 1), cfg_default.workers);
+
+    var cfg_multi = try Config.parse(std.testing.allocator,
+        \\[server]
+        \\workers = 4
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg_multi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 4), cfg_multi.workers);
+}
+
+test "parse config - duplicate user key does not leak (last value wins)" {
+    // std.testing.allocator fails the test on any leak, so this also guards the
+    // getOrPut-style dedup that replaced the leaking put().
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\alice = "ffeeddccbbaa99887766554433221100"
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+    const secret = cfg.users.get("alice").?;
+    try std.testing.expectEqual(@as(u8, 0xff), secret[0]);
+}
+
+test "parse config - empty tls_domain is rejected" {
+    const content =
+        \\[censorship]
+        \\tls_domain = ""
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    try std.testing.expectError(error.EmptyTlsDomain, Config.parse(std.testing.allocator, content));
 }
 
 test "parse config - fuzz malformed/random content" {

@@ -1,6 +1,69 @@
 /* MTProto Proxy Dashboard — frontend logic */
 
 const $ = id => document.getElementById(id);
+
+// ── i18n (EN/RU) ──────────────────────────────────────────────
+// Prose, labels and buttons are translated; technical proper nouns (MiddleProxy,
+// socks5, Nginx, RX/TX) stay as-is — that's normal bilingual UI, not code-switching.
+const I18N = {
+  en: {
+    'header.refresh': 'Refresh', 'header.uptime': 'Uptime', 'header.lastUpdate': 'Last update',
+    'card.cpu': '⬡ CPU', 'card.cpuSub': 'utilization', 'card.memory': '◈ Memory', 'card.network': '◎ Network Throughput',
+    'stats.activeOf': 'Active /', 'stats.handshakes': 'Handshakes', 'stats.total': 'Total Connections',
+    'users.title': '👥 Users', 'users.add': '+ Add User', 'users.who': 'Who is this for?',
+    'users.secret': 'Secret', 'users.secretHint': '(leave empty to auto-generate)',
+    'users.namePh': 'e.g. Мама, dad, work 💼', 'users.secretPh': "Leave blank — we'll create one for you",
+    'btn.create': 'Create', 'btn.cancel': 'Cancel', 'btn.apply': 'Apply', 'btn.pin': 'Pin', 'btn.setTarget': 'Set target', 'btn.delete': 'Delete', 'btn.close': 'Close',
+    'routing.title': 'Routing & Upstream', 'routing.upstream': 'Upstream', 'routing.tunnelPin': 'Tunnel pin',
+    'routing.proxyHost': 'Proxy host', 'routing.port': 'Port', 'routing.user': 'User', 'routing.pass': 'Pass', 'routing.target': 'Target', 'routing.policy': 'Policy',
+    'mask.title': 'Masking Health', 'mask.mode': 'Mode', 'mask.endpoint': 'Endpoint', 'mask.timer': 'Health Timer',
+    'logs.title': '▸ Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
+    'modal.deleteUser': 'Delete User', 'modal.deleteTunnel': 'Delete Tunnel', 'modal.restartNote': 'The proxy will be restarted to apply changes.',
+    'share.subtitle': 'Point their phone camera at this code to connect.', 'share.copyLink': 'Copy link', 'share.send': 'Send', 'share.with': 'Share with',
+    'status.online': 'Online', 'status.offline': 'Offline', 'status.stuck': 'Stuck',
+    'status.healthy': 'Healthy', 'status.needsAttention': 'Needs attention', 'status.disabled': 'Disabled', 'status.remoteMode': 'Remote mode', 'status.endpointOk': 'OK', 'status.endpointDown': 'not responding',
+    'hero.checking': 'Checking…', 'hero.offline': "Your proxy is offline — friends can't connect until it's back.",
+    'hero.stalled': 'Your proxy is running but not responding — it looks stuck. Restarting usually fixes this.',
+    'hero.idle': 'Your proxy is online and ready. No one is connected yet — share a link to get started.',
+    'hero.busy': "Everything's working. {n} connected right now.",
+    'toast.connected': 'Someone just connected through your proxy.',
+    'toast.linkCopied': 'Link copied — send it to someone you love.',
+    'autoscroll.on': 'Auto-scroll: on', 'autoscroll.off': 'Auto-scroll: off', 'btn.pause': 'Pause', 'btn.resume': 'Resume',
+  },
+  ru: {
+    'header.refresh': 'Обновление', 'header.uptime': 'Аптайм', 'header.lastUpdate': 'Обновлено',
+    'card.cpu': '⬡ CPU', 'card.cpuSub': 'загрузка', 'card.memory': '◈ Память', 'card.network': '◎ Сетевой трафик',
+    'stats.activeOf': 'Активно /', 'stats.handshakes': 'Подключаются', 'stats.total': 'Всего подключений',
+    'users.title': '👥 Пользователи', 'users.add': '+ Добавить', 'users.who': 'Для кого это?',
+    'users.secret': 'Секрет', 'users.secretHint': '(пусто — сгенерируем сами)',
+    'users.namePh': 'напр. Мама, папа, работа 💼', 'users.secretPh': 'Оставьте пустым — создадим сами',
+    'btn.create': 'Создать', 'btn.cancel': 'Отмена', 'btn.apply': 'Применить', 'btn.pin': 'Закрепить', 'btn.setTarget': 'Задать', 'btn.delete': 'Удалить', 'btn.close': 'Закрыть',
+    'routing.title': 'Маршрутизация и выход', 'routing.upstream': 'Выход', 'routing.tunnelPin': 'Туннель',
+    'routing.proxyHost': 'Хост прокси', 'routing.port': 'Порт', 'routing.user': 'Логин', 'routing.pass': 'Пароль', 'routing.target': 'Цель', 'routing.policy': 'Политика',
+    'mask.title': 'Маскировка', 'mask.mode': 'Режим', 'mask.endpoint': 'Эндпоинт', 'mask.timer': 'Таймер проверки',
+    'logs.title': '▸ Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
+    'modal.deleteUser': 'Удалить пользователя', 'modal.deleteTunnel': 'Удалить туннель', 'modal.restartNote': 'Прокси будет перезапущен для применения изменений.',
+    'share.subtitle': 'Наведите камеру их телефона на этот код, чтобы подключиться.', 'share.copyLink': 'Скопировать ссылку', 'share.send': 'Отправить', 'share.with': 'Поделиться с',
+    'status.online': 'Онлайн', 'status.offline': 'Офлайн', 'status.stuck': 'Завис',
+    'status.healthy': 'Здоров', 'status.needsAttention': 'Требует внимания', 'status.disabled': 'Выключено', 'status.remoteMode': 'Удалённый режим', 'status.endpointOk': 'OK', 'status.endpointDown': 'не отвечает',
+    'hero.checking': 'Проверка…', 'hero.offline': 'Прокси офлайн — близкие не смогут подключиться, пока он не запустится.',
+    'hero.stalled': 'Прокси запущен, но не отвечает — похоже, завис. Обычно помогает перезапуск.',
+    'hero.idle': 'Прокси онлайн и готов. Пока никто не подключён — поделитесь ссылкой, чтобы начать.',
+    'hero.busy': 'Всё работает. Сейчас подключено: {n}.',
+    'toast.connected': 'Кто-то только что подключился через ваш прокси.',
+    'toast.linkCopied': 'Ссылка скопирована — отправьте близкому.',
+    'autoscroll.on': 'Автопрокрутка: вкл', 'autoscroll.off': 'Автопрокрутка: выкл', 'btn.pause': 'Пауза', 'btn.resume': 'Продолжить',
+  },
+};
+let LANG = localStorage.getItem('dashLang') || ((navigator.language || '').toLowerCase().startsWith('ru') ? 'ru' : 'en');
+function t(k) { return (I18N[LANG] && I18N[LANG][k]) || (I18N.en && I18N.en[k]) || k; }
+function applyStaticI18n() {
+  document.documentElement.setAttribute('lang', LANG);
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.getAttribute('data-i18n')); });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph'))); });
+  const tg = $('langToggle'); if (tg) tg.textContent = (LANG === 'ru') ? 'EN' : 'RU';
+}
+function setLang(l) { LANG = (l === 'ru') ? 'ru' : 'en'; localStorage.setItem('dashLang', LANG); applyStaticI18n(); }
 const MH = 90;       // max history points
 const MAX_LINES = 300;
 let autoScrollEnabled = true;
@@ -322,6 +385,73 @@ function showToast(msg, type) {
   }, 3000);
 }
 
+// One plain-language verdict at the top of the page — the answer to the only
+// question most people open the dashboard to ask: "is everything OK?"
+function setStatusHero(online, active, state) {
+  const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText');
+  if (!el) return;
+  if (!online) {
+    el.style.background = 'rgba(255,80,80,0.10)';
+    el.style.color = 'var(--red,#ff6b6b)';
+    icon.textContent = '✖';
+    txt.textContent = t('hero.offline');
+  } else if (state === 'stalled') {
+    el.style.background = 'rgba(240,180,40,0.12)';
+    el.style.color = 'var(--amber,#f0b428)';
+    icon.textContent = '!';
+    txt.textContent = t('hero.stalled');
+  } else if (active > 0) {
+    el.style.background = 'rgba(80,220,120,0.10)';
+    el.style.color = 'var(--green,#46d369)';
+    icon.textContent = '✓';
+    txt.textContent = t('hero.busy').replace('{n}', active);
+  } else {
+    el.style.background = 'rgba(80,220,120,0.08)';
+    el.style.color = 'var(--green,#46d369)';
+    icon.textContent = '✓';
+    txt.textContent = t('hero.idle');
+  }
+}
+
+// The "share with someone you love" moment: a scannable QR + one-tap send.
+function closeShareModal() {
+  const o = document.getElementById('shareModalOverlay');
+  if (o) o.remove();
+}
+function openShareModal(name, link) {
+  closeShareModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'shareModalOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeShareModal(); });
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--bg-card,#16181d);border:1px solid var(--border,#333);border-radius:14px;padding:22px;max-width:340px;text-align:center;color:var(--text,#eee);font-family:inherit;';
+  box.innerHTML =
+    '<div style="font-size:16px;font-weight:700;margin-bottom:4px;">' + t('share.with') + ' ' + esc(name || 'this person') + '</div>' +
+    '<div style="font-size:13px;color:var(--text-muted,#999);margin-bottom:14px;">' + t('share.subtitle') + '</div>' +
+    '<img src="/api/qr?text=' + encodeURIComponent(link) + '" alt="QR code" style="width:240px;height:240px;background:#fff;border-radius:10px;padding:8px;box-sizing:border-box;" />' +
+    '<div style="display:flex;gap:8px;margin-top:16px;">' +
+    '<button class="ui-btn" id="shareCopyBtn" style="flex:1;">' + t('share.copyLink') + '</button>' +
+    '<button class="ui-btn" id="shareSendBtn" style="flex:1;">' + t('share.send') + '</button>' +
+    '</div>' +
+    '<button class="ui-btn" id="shareCloseBtn" style="margin-top:10px;width:100%;">' + t('btn.close') + '</button>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  document.getElementById('shareCopyBtn').addEventListener('click', async () => {
+    await copyText(link);
+    showToast(t('toast.linkCopied'), 'success');
+  });
+  document.getElementById('shareSendBtn').addEventListener('click', () => {
+    if (navigator.share) {
+      navigator.share({ title: 'Telegram proxy', text: 'Tap to connect to Telegram — I set this up for you:', url: link }).catch(() => {});
+    } else {
+      copyText(link);
+      showToast('Link copied — paste it to share.', 'success');
+    }
+  });
+  document.getElementById('shareCloseBtn').addEventListener('click', closeShareModal);
+}
+
 async function apiCall(url, body) {
   const r = await fetch(url, {
     method: 'POST',
@@ -374,10 +504,14 @@ function setupAddUserForm() {
 
     try {
       const data = await apiCall('/api/users/add', { name, secret: secret || undefined });
-      showToast(`User "${data.name}" created. Proxy restarted.`, 'success');
+      showToast(`Done! Here is ${data.label || data.name}'s connection — send it to them now.`, 'success');
       form.style.display = 'none';
       _users_cache_bust();
       await runPoll();
+      // End the create flow in the share moment: open the QR modal for the new user
+      // (names are restricted to [a-zA-Z0-9_-], so the selector needs no escaping).
+      const shareBtn = document.querySelector('.user-share[data-name="' + data.name + '"]');
+      if (shareBtn && !shareBtn.disabled) shareBtn.click();
     } catch (e) {
       status.textContent = e.message;
       status.className = 'form-status error';
@@ -542,7 +676,7 @@ function renderUsers(users, perUserActive, proxyStats) {
   meta.textContent = metaText;
 
   if (!users?.links_ready) {
-    note.textContent = 'Public IP could not be detected. Set [server].public_ip in config.toml.';
+    note.textContent = "We couldn't detect your server's public IP, so connection links aren't ready yet. Add your server's IP in the config and the links will appear.";
   } else {
     note.textContent = users.server + ':' + users.port + ' · tls_domain=' + (users.tls_domain || '—');
   }
@@ -560,6 +694,7 @@ function renderUsers(users, perUserActive, proxyStats) {
     const tgData = encodeURIComponent(tg);
     const tmeData = encodeURIComponent(tme);
     const userName = esc(u.name || 'user');
+    const displayName = esc(u.label || u.name || 'user');
     const rowClass = isEnabled ? 'user-row' : 'user-row disabled';
     const sessions = Number(pua[u.name] || 0);
     const sessionsBadge = isEnabled
@@ -577,10 +712,11 @@ function renderUsers(users, perUserActive, proxyStats) {
       : '<button class="ui-btn user-direct-toggle" type="button" data-user="' + userName + '" data-direct="true" title="Switch to direct route">default</button>');
 
     return '<div class="' + rowClass + '">' +
-      '<div class="user-name">' + toggleSwitch + userName + sessionsBadge + '</div>' +
+      '<div class="user-name">' + toggleSwitch + displayName + sessionsBadge + '</div>' +
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
+      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + '>📲 Share</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + '>Copy tg://</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + '>Copy t.me</button>' +
       '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
@@ -603,6 +739,14 @@ function renderUsers(users, perUserActive, proxyStats) {
         btn.textContent = original;
         btn.classList.remove('active');
       }, 1100);
+    });
+  });
+
+  // Share buttons → QR modal (the "send it to someone you love" moment)
+  list.querySelectorAll('.user-share').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const link = decodeURIComponent(btn.dataset.link || '');
+      if (link) openShareModal(btn.dataset.label || btn.dataset.name || '', link);
     });
   });
 
@@ -895,10 +1039,10 @@ function renderRouting(routing) {
   const badge = $('routingBadge');
   if (routing.healthy) {
     badge.className = 'badge';
-    $('routingStatus').textContent = 'Healthy';
+    $('routingStatus').textContent = t('status.healthy');
   } else {
     badge.className = 'badge off';
-    $('routingStatus').textContent = 'Degraded';
+    $('routingStatus').textContent = t('status.needsAttention');
   }
 
   $('routingMiddle').textContent = routing.middle_proxy_enabled ? 'enabled' : 'disabled';
@@ -997,20 +1141,28 @@ async function poll() {
   // Server
   $('srvUptime').textContent = d.uptime;
   const pi = d.proxy_info || {};
-  $('proxyUp').textContent = pi.uptime || '—';
+  $('proxyUp').textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : (t('status.online') + ' · ' + (pi.uptime || '')));
   $('proxyPid').textContent = pi.pid || '—';
   $('proxyRss').textContent = (pi.rss_mb || 0) + ' MB';
   $('statusBadge').className = pi.online ? 'badge' : 'badge off';
 
   // Proxy stats
   const p = d.proxy || {};
-  $('pxActive').textContent = p.active || 0;
+  const _act = p.active || 0;
+  // Celebrate the moment a real person first comes online through this proxy.
+  if (window._prevActive != null && window._prevActive === 0 && _act > 0) {
+    showToast(t('toast.connected'), 'success');
+  }
+  window._prevActive = _act;
+  setStatusHero(pi.online, _act, pi.state);
+  $('pxActive').textContent = _act;
   $('pxMax').textContent = p.max || 0;
   $('pxHs').textContent = p.hs_inflight || 0;
   $('pxTotal').textContent = (p.total || 0).toLocaleString();
   const drp = p.rate_drops || 0;
   $('pxDrops').textContent = drp;
   $('pxDrops').style.color = drp > 0 ? 'var(--amber)' : 'var(--text-muted)';
+  $('pxDrops').title = "Blocked connection attempts. Some of these are normal — it's your proxy turning away scanners and abuse. A steady small number is healthy.";
   $('pxDropLbl').textContent = 'rate +' + drp + ' · cap +' + (p.cap_drops || 0) + ' · hs_t +' + (p.hs_timeout || 0);
 
 
@@ -1033,16 +1185,16 @@ async function poll() {
     const maskBadge = $('maskBadge');
     if (!masking.enabled) {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = 'Disabled';
+      $('maskStatus').textContent = t('status.disabled');
     } else if (masking.mode === 'remote') {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = 'Remote mode';
+      $('maskStatus').textContent = t('status.remoteMode');
     } else if (masking.healthy) {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = 'Healthy';
+      $('maskStatus').textContent = t('status.healthy');
     } else {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = 'Degraded';
+      $('maskStatus').textContent = t('status.needsAttention');
     }
 
     let modeText = masking.mode || '—';
@@ -1060,9 +1212,9 @@ async function poll() {
     let endpointText = masking.target || '—';
     if (masking.mode === 'local' || masking.mode === 'custom') {
       if (masking.endpoint_ok === true) {
-        endpointText += ' (OK)';
+        endpointText += ' (' + t('status.endpointOk') + ')';
       } else if (masking.endpoint_ok === false) {
-        endpointText += ' (DOWN)';
+        endpointText += ' (' + t('status.endpointDown') + ')';
       }
     }
     $('maskTarget').textContent = endpointText;
@@ -1121,7 +1273,7 @@ function updateFreshness() {
 }
 
 function updatePollControls() {
-  $('pollToggle').textContent = pollingPaused ? 'Resume' : 'Pause';
+  $('pollToggle').textContent = pollingPaused ? t('btn.resume') : t('btn.pause');
   $('pollToggle').classList.toggle('active', !pollingPaused);
 }
 
@@ -1171,6 +1323,17 @@ $('pollToggle').addEventListener('click', () => {
   setPollingPaused(!pollingPaused);
 });
 
+// Language toggle (EN/RU) — defaults to the browser language, persists the choice.
+const langToggleBtn = $('langToggle');
+if (langToggleBtn) {
+  langToggleBtn.addEventListener('click', () => {
+    setLang(LANG === 'ru' ? 'en' : 'ru');
+    updatePollControls();
+    updateAutoScrollButton();
+  });
+}
+applyStaticI18n();
+
 updatePollControls();
 updateFreshness();
 setupAddUserForm();
@@ -1198,7 +1361,7 @@ function jumpToLatest() {
 }
 
 function updateAutoScrollButton() {
-  autoScrollBtn.textContent = autoScrollEnabled ? 'Auto-scroll: on' : 'Auto-scroll: off';
+  autoScrollBtn.textContent = autoScrollEnabled ? t('autoscroll.on') : t('autoscroll.off');
   autoScrollBtn.classList.toggle('active', autoScrollEnabled);
 }
 
@@ -1265,7 +1428,10 @@ function addLine(d, anim) {
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
-  return d.innerHTML;
+  // textContent->innerHTML escapes & < > but NOT quotes; escape them too so the
+  // result is safe to interpolate into double/single-quoted HTML attributes
+  // (e.g. data-user="..."), preventing attribute-injection XSS.
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function connectWS() {

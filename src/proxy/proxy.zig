@@ -15,6 +15,7 @@ const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
+const sd_notify = @import("sd_notify.zig");
 const Config = @import("../config.zig").Config;
 const upstream_mod = @import("upstream.zig");
 const tunnel_mod = @import("../tunnel.zig");
@@ -56,6 +57,7 @@ test {
     _ = @import("socket_utils.zig");
     _ = @import("network_detect.zig");
     _ = @import("http_fetch.zig");
+    _ = @import("sd_notify.zig");
     _ = @import("fd_limits.zig");
     _ = @import("connection_phase.zig");
     _ = @import("net_helpers.zig");
@@ -73,7 +75,18 @@ test {
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
+/// Upper bound on SO_REUSEPORT epoll worker threads ([server].workers / 0=auto).
+const max_workers = 256;
+/// A worker not ticking within this window is treated as wedged: the signal owner
+/// then stops petting the systemd watchdog so the unit is restarted.
+const watchdog_stale_ms: i64 = 10_000;
 const event_loop_wait_ms: i32 = 37;
+/// How long after its first byte a non-TLS (dd) connection may take to deliver
+/// the full 64-byte obfuscated handshake before we treat it as a probe and serve
+/// the masking cover. Real dd clients send the whole handshake in the first
+/// packet, so a few seconds is generous; keeping it well below
+/// handshake_timeout_sec shrinks the active-probe timing oracle on the dd path.
+const dd_handshake_decision_ms: i64 = 4000;
 const desync_wait_poll_ms: i32 = 3;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
@@ -144,6 +157,15 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return b == null;
 }
 
+// Lock around the shared middle-proxy snapshot. Zig 0.16 has no std.Thread.Mutex
+// / std.Thread.RwLock, so this wraps std.Io.Mutex — a real cross-thread futex
+// mutex (atomic CAS fast path + futex park/wake via the Io) driven by the global
+// single-threaded Io (which disables only async task spawning, NOT mutual
+// exclusion). Cross-thread correctness matters because the middle-proxy updater
+// runs on its own thread AND, under the SO_REUSEPORT multi-worker model, N worker
+// threads read the snapshot concurrently. Readers serialize (no real RwLock
+// available), which is fine — the snapshot is read once per connection at routing
+// time, not on the per-byte relay path.
 const CompatRwLock = struct {
     mutex: std.Io.Mutex = .init,
 
@@ -174,6 +196,11 @@ const UpstreamKind = enum {
     mask,
 };
 
+const ClientTransport = enum {
+    fake_tls,
+    direct_obfuscated,
+};
+
 const MiddleProxyHandshakeStep = enum {
     none,
     sending_rpc_nonce,
@@ -182,6 +209,39 @@ const MiddleProxyHandshakeStep = enum {
     waiting_rpc_handshake_response,
     done,
 };
+
+const MiddleProxyFetchRoute = enum {
+    direct,
+    tunnel,
+    socks5,
+    http_connect,
+};
+
+fn middleProxyFetchRouteForConfig(cfg: *const Config) MiddleProxyFetchRoute {
+    return switch (cfg.upstream_mode) {
+        .socks5 => .socks5,
+        .http => .http_connect,
+        .tunnel => .tunnel,
+        .auto, .direct => .direct,
+    };
+}
+
+test "middle-proxy refresh selects proxy route for explicit socks5 and http upstreams" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    cfg.upstream_mode = .socks5;
+    try std.testing.expectEqual(MiddleProxyFetchRoute.socks5, middleProxyFetchRouteForConfig(&cfg));
+
+    cfg.upstream_mode = .http;
+    try std.testing.expectEqual(MiddleProxyFetchRoute.http_connect, middleProxyFetchRouteForConfig(&cfg));
+
+    cfg.upstream_mode = .tunnel;
+    try std.testing.expectEqual(MiddleProxyFetchRoute.tunnel, middleProxyFetchRouteForConfig(&cfg));
+}
 
 const DcConnectPlan = middle_proxy_routing.DcConnectPlan;
 const buildDcConnectPlan = middle_proxy_routing.buildDcConnectPlan;
@@ -309,10 +369,15 @@ const ConnectionSlot = struct {
     client_fd: posix.fd_t = -1,
     upstream_fd: posix.fd_t = -1,
     upstream_kind: UpstreamKind = .none,
+    client_transport: ClientTransport = .fake_tls,
     peer_addr: Address = undefined,
 
     phase: ConnectionPhase = .idle,
     active_reserved: bool = false,
+    /// True while this connection occupies a handshake-inflight budget slot.
+    /// Counted at FIRST BYTE (not accept), so silent/pre-first-byte TCP sessions
+    /// (mobile pre-warmed sockets, zero-byte slow-loris) never hold the budget.
+    hs_counted: bool = false,
 
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
@@ -441,6 +506,7 @@ const ConnectionSlot = struct {
     fn handshakeInProgress(self: *const ConnectionSlot) bool {
         return switch (self.phase) {
             .reading_tls_header,
+            .reading_direct_obfuscated_handshake,
             .reading_client_hello_body,
             .writing_server_hello_first,
             .desync_wait,
@@ -600,6 +666,77 @@ const SignalController = struct {
     }
 };
 
+/// Bounded, low-cardinality classification of why a connection closed. The first
+/// five buckets are the evasion/probe signals a circumvention operator needs to
+/// SEE a censor start blocking (a spike in tls_validation_failed / replay /
+/// handshake_timeout vs baseline). Exported as mtproto_connection_close_reason_total{reason}.
+pub const CloseReason = enum(u8) {
+    tls_validation_failed,
+    sni_mismatch,
+    replay_detected,
+    handshake_budget,
+    handshake_timeout,
+    idle_timeout,
+    bad_handshake,
+    client_eof,
+    client_error,
+    upstream_error,
+    epoll_error,
+    internal_error,
+    shutdown,
+    other,
+
+    pub const count = @typeInfo(CloseReason).@"enum".fields.len;
+
+    /// Bucket a free-text closeSlot reason. Evasion signals matched precisely first.
+    pub fn classify(reason: []const u8) CloseReason {
+        const has = struct {
+            fn f(h: []const u8, n: []const u8) bool {
+                return std.mem.indexOf(u8, h, n) != null;
+            }
+        }.f;
+        if (has(reason, "tls validation failed")) return .tls_validation_failed;
+        if (has(reason, "sni")) return .sni_mismatch; // mismatch + missing sni
+        if (has(reason, "replay")) return .replay_detected;
+        if (has(reason, "budget")) return .handshake_budget;
+        if (has(reason, "idle")) return .idle_timeout;
+        if (has(reason, "timeout")) return .handshake_timeout;
+        if (has(reason, "shutdown") or has(reason, "closing")) return .shutdown;
+        if (has(reason, "bad ") or has(reason, "invalid") or has(reason, "unexpected") or has(reason, "alert")) return .bad_handshake;
+        // Upstream-side markers FIRST: "s2c" (server→client reads) and the dd-relay's
+        // "direct obfuscated s2c …" reasons are upstream reads, so they must bucket as
+        // upstream_error rather than falling through to the generic eof/read-error
+        // (client) buckets below.
+        if (has(reason, "connect") or has(reason, "upstream") or has(reason, "candidate") or has(reason, "relay ") or has(reason, "dc tail") or has(reason, "middleproxy") or has(reason, "s2c")) return .upstream_error;
+        if (has(reason, "eof")) return .client_eof;
+        if (has(reason, "epoll") or has(reason, "interest") or has(reason, "desync") or has(reason, "fd map")) return .epoll_error;
+        if (has(reason, "read error")) return .client_error;
+        // Only reasons that actually signal an error map to internal_error; any
+        // other unmatched (benign/uncategorized) close lands in .other so the
+        // internal_error counter stays meaningful for operators.
+        if (has(reason, "error") or has(reason, "fail")) return .internal_error;
+        return .other;
+    }
+};
+
+test "CloseReason.classify buckets the evasion signals precisely" {
+    try std.testing.expectEqual(CloseReason.tls_validation_failed, CloseReason.classify("tls validation failed"));
+    try std.testing.expectEqual(CloseReason.sni_mismatch, CloseReason.classify("tls sni mismatch"));
+    try std.testing.expectEqual(CloseReason.sni_mismatch, CloseReason.classify("tls missing sni"));
+    try std.testing.expectEqual(CloseReason.replay_detected, CloseReason.classify("replay detected, masking failed"));
+    try std.testing.expectEqual(CloseReason.handshake_budget, CloseReason.classify("handshake budget exhausted"));
+    try std.testing.expectEqual(CloseReason.handshake_timeout, CloseReason.classify("handshake timeout"));
+    try std.testing.expectEqual(CloseReason.handshake_timeout, CloseReason.classify("dd handshake decision timeout"));
+    try std.testing.expectEqual(CloseReason.idle_timeout, CloseReason.classify("idle pre-first-byte timeout"));
+    try std.testing.expectEqual(CloseReason.bad_handshake, CloseReason.classify("bad tls length"));
+    try std.testing.expectEqual(CloseReason.client_eof, CloseReason.classify("client eof before tls header"));
+    try std.testing.expectEqual(CloseReason.upstream_error, CloseReason.classify("connect failed"));
+    try std.testing.expectEqual(CloseReason.shutdown, CloseReason.classify("shutdown"));
+    // Genuine errors → internal_error; benign/uncategorized reasons → other.
+    try std.testing.expectEqual(CloseReason.internal_error, CloseReason.classify("config parse failure"));
+    try std.testing.expectEqual(CloseReason.other, CloseReason.classify("graceful drain"));
+}
+
 pub const ProxyState = struct {
     pub const UserMetrics = struct {
         name: []const u8,
@@ -626,6 +763,7 @@ pub const ProxyState = struct {
         drops_handshake_budget_total: u64,
         handshake_timeouts_total: u64,
         middleproxy_fallback_total: u64,
+        close_reasons: [CloseReason.count]u64,
         client_to_upstream_bytes_total: u64,
         upstream_to_client_bytes_total: u64,
         config_port: u16,
@@ -880,6 +1018,36 @@ pub const ProxyState = struct {
     stats_dropped_hs_budget: std.atomic.Value(u64),
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
+    /// Per-reason connection close counters (RED errors + evasion signals).
+    close_reasons: [CloseReason.count]std.atomic.Value(u64),
+    /// Per-worker monotonic-ms liveness heartbeat (index = worker_id). /healthz and
+    /// the watchdog require EVERY active worker to be fresh, so a wedged non-owner
+    /// SO_REUSEPORT shard is detected (not masked by worker 0 staying alive). 0 until
+    /// a worker starts ticking.
+    worker_heartbeats: [max_workers]std.atomic.Value(i64),
+    /// Anti-flood + per-subnet rate guards are SHARED across workers (behind
+    /// guard_lock) so an IP/subnet spread across SO_REUSEPORT shards is still limited
+    /// globally, not ~N×threshold. Touched only on the accept/handshake path.
+    subnet_limiter: SubnetRateLimit,
+    flood_guard: *HandshakeFloodGuard,
+    guard_lock: CompatRwLock = .{},
+    /// True once graceful shutdown/drain has begun — drives /readyz.
+    shutting_down: std.atomic.Value(bool),
+    /// $NOTIFY_SOCKET (set by systemd Type=notify); null when not run under
+    /// systemd. Borrowed from the process environ (lives for process lifetime).
+    notify_socket: ?[]const u8 = null,
+    /// $WATCHDOG_USEC (systemd WatchdogSec); 0 disables watchdog pings.
+    watchdog_usec: u64 = 0,
+    /// Diagnostic budget: log the first N incoming ClientHello fingerprints (what a
+    /// real client offers) at info, then go quiet. Lets an operator capture the
+    /// real client shape on deploy (connect once) without ongoing log spam.
+    clienthello_fp_budget: std.atomic.Value(u32) = std.atomic.Value(u32).init(16),
+    /// Resolved SO_REUSEPORT worker count (1 = single-threaded). Set in run().
+    /// Gates SIGHUP config reload: a live reload mutates shared config string
+    /// slices (e.g. tls_domain) and frees the old ones, which would race the N
+    /// worker threads reading them on the handshake path — so with >1 worker the
+    /// reload is refused and a restart is required to apply config changes.
+    effective_workers: usize = 1,
 
     middle_proxy_lock: CompatRwLock = .{},
     // Regular (non-media) primary endpoints per DC 1..5. Matches `proxy_for N`
@@ -970,6 +1138,7 @@ pub const ProxyState = struct {
             .stats_dropped_flood_guard = std.atomic.Value(u64).init(0),
             .stats_dropped_hs_budget = std.atomic.Value(u64).init(0),
             .stats_hs_timeout = std.atomic.Value(u64).init(0),
+            .close_reasons = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** CloseReason.count,
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
@@ -984,6 +1153,10 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
+            .worker_heartbeats = [_]std.atomic.Value(i64){std.atomic.Value(i64).init(0)} ** max_workers,
+            .subnet_limiter = SubnetRateLimit.init(),
+            .flood_guard = try HandshakeFloodGuard.create(allocator),
+            .shutting_down = std.atomic.Value(bool).init(false),
             .middle_proxy_updater_thread = null,
             .upstream = upblk: {
                 switch (cfg.upstream_mode) {
@@ -1075,6 +1248,7 @@ pub const ProxyState = struct {
             thread.join();
             self.middle_proxy_updater_thread = null;
         }
+        self.flood_guard.destroy(self.allocator);
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         freeUserMetricsSlice(self.allocator, self.user_metrics);
@@ -1092,9 +1266,61 @@ pub const ProxyState = struct {
         return null;
     }
 
+    /// Liveness: have ALL active workers iterated within threshold_ms? Returns
+    /// false if ANY started worker has stalled, so a wedged non-owner SO_REUSEPORT
+    /// shard is surfaced (not masked by worker 0 staying alive). Lenient before a
+    /// worker first ticks (heartbeat 0) so /healthz doesn't fail during startup.
+    pub fn loopAlive(self: *const ProxyState, threshold_ms: i64) bool {
+        const now = nowMs();
+        const n = @min(self.effective_workers, max_workers);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const hb = self.worker_heartbeats[i].load(.monotonic);
+            if (hb == 0) continue; // not started ticking yet
+            if (now - hb >= threshold_ms) return false; // this worker stalled
+        }
+        return true;
+    }
+
+    /// Readiness: serving and not draining. (Not gated on middleproxy — it runs
+    /// on bundled defaults and may never refresh on a censored host.)
+    pub fn isReady(self: *const ProxyState) bool {
+        return !self.shutting_down.load(.acquire);
+    }
+
+    // ── Shared anti-flood / subnet-rate guards (global across workers) ──
+    // Each call holds guard_lock so the shared tables stay consistent under N
+    // worker threads. Only on the accept/handshake path, so contention is bounded.
+
+    fn floodIsBlocked(self: *ProxyState, addr: Address, cfg: HandshakeFloodGuard.Settings) bool {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.flood_guard.isBlocked(addr, cfg);
+    }
+
+    fn floodRecord(self: *ProxyState, addr: Address, event: HandshakeFloodGuard.Event, cfg: HandshakeFloodGuard.Settings) bool {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.flood_guard.record(addr, event, cfg);
+    }
+
+    fn floodTop(self: *ProxyState, cfg: HandshakeFloodGuard.Settings, out: []HandshakeFloodGuard.TopEntry) usize {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.flood_guard.top(cfg, out);
+    }
+
+    fn subnetCheck(self: *ProxyState, addr: Address, max_per_sec: u8) bool {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.subnet_limiter.check(addr, max_per_sec);
+    }
+
     pub fn getMetricsSnapshot(self: *const ProxyState) MetricsSnapshot {
         const now = realtimeSeconds();
         const accepted_total = self.connection_count.load(.monotonic);
+        var close_reasons: [CloseReason.count]u64 = undefined;
+        for (&self.close_reasons, 0..) |*c, idx| close_reasons[idx] = c.load(.monotonic);
         return .{
             .start_time_seconds = self.start_time_seconds,
             .uptime_seconds = @max(@as(i64, 0), now - self.start_time_seconds),
@@ -1113,6 +1339,7 @@ pub const ProxyState = struct {
             .drops_handshake_budget_total = self.stats_dropped_hs_budget.load(.monotonic),
             .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
             .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
+            .close_reasons = close_reasons,
             .client_to_upstream_bytes_total = self.client_to_upstream_bytes_total.load(.monotonic),
             .upstream_to_client_bytes_total = self.upstream_to_client_bytes_total.load(.monotonic),
             .config_port = self.config.port,
@@ -1133,6 +1360,9 @@ pub const ProxyState = struct {
 
         var ipv6_ok = true;
         var server: net.Server = undefined;
+        // The address `server` is bound to, captured so additional SO_REUSEPORT
+        // worker listeners can be created on the same addr:port.
+        var listen_addr: Address = undefined;
 
         if (self.config.bind_address) |bind_str| {
             // Explicit bind address from config
@@ -1141,11 +1371,12 @@ pub const ProxyState = struct {
                 return error.InvalidBindAddress;
             };
             ipv6_ok = isIpv6(parsed);
+            listen_addr = parsed;
             server = try parsed.listen(io_ctx, .{
                 .reuse_address = true,
                 .kernel_backlog = @intCast(self.config.backlog),
             });
-            log.info("Listening on {s}:{d} (epoll, single-thread)", .{ bind_str, self.config.port });
+            log.info("Listening on {s}:{d} (epoll)", .{ bind_str, self.config.port });
         } else {
             // Default: try [::] (dual-stack), fall back to 0.0.0.0
             const address = ip6(
@@ -1154,6 +1385,7 @@ pub const ProxyState = struct {
                 0,
                 0,
             );
+            listen_addr = address;
             server = address.listen(io_ctx, .{
                 .reuse_address = true,
                 .kernel_backlog = @intCast(self.config.backlog),
@@ -1162,6 +1394,7 @@ pub const ProxyState = struct {
                     ipv6_ok = false;
                     log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
                     const address_v4 = ip4(.{ 0, 0, 0, 0 }, self.config.port);
+                    listen_addr = address_v4;
                     break :blk try address_v4.listen(io_ctx, .{
                         .reuse_address = true,
                         .kernel_backlog = @intCast(self.config.backlog),
@@ -1171,29 +1404,39 @@ pub const ProxyState = struct {
             };
 
             if (ipv6_ok) {
-                log.info("Listening on [::]:{d} (epoll, single-thread)", .{self.config.port});
+                log.info("Listening on [::]:{d} (epoll)", .{self.config.port});
             } else {
-                log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
+                log.info("Listening on 0.0.0.0:{d} (epoll)", .{self.config.port});
             }
         }
         defer server.deinit(io_ctx);
 
         setNonBlocking(server.socket.handle);
 
-        if (self.config.use_middle_proxy and self.config.datacenter_override == null) {
-            self.refreshMiddleProxyInfo() catch |err| {
-                if (isMiddleProxyRefreshNetworkError(err)) {
-                    log.info("Initial middle-proxy refresh unavailable ({s}), using bundled defaults", .{@errorName(err)});
-                } else {
-                    log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
-                }
-            };
+        // Resolve the worker count: 1 = classic single loop (default, unchanged),
+        // 0 = auto (one per CPU), clamped to [1, max_workers]. Published on the
+        // shared state so SIGHUP reload can refuse a racy live-reload under >1.
+        var worker_count: usize = self.config.workers;
+        if (worker_count == 0) worker_count = std.Thread.getCpuCount() catch 1;
+        worker_count = std.math.clamp(worker_count, 1, max_workers);
+        self.effective_workers = worker_count;
 
+        if (self.config.use_middle_proxy and self.config.datacenter_override == null) {
+            // The INITIAL middle-proxy metadata refresh now runs inside the
+            // updater thread (see middleProxyUpdaterMain), NOT synchronously
+            // here, so a blocked/stalled core.telegram.org fetch on a censored
+            // host cannot delay the event loop from accepting connections (the
+            // std.http fetch has no read timeout). The proxy serves immediately
+            // on bundled fallback addresses and upgrades the cache in the
+            // background as soon as the network allows.
             self.middle_proxy_updater_shutdown.store(false, .release);
             if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
                 self.middle_proxy_updater_thread = updater;
             } else |err| {
                 log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
+                // No background thread: best-effort synchronous refresh so
+                // metadata is still populated (bounded by the OS connect timeout).
+                self.refreshMiddleProxyInfo() catch {};
             }
         }
 
@@ -1213,16 +1456,99 @@ pub const ProxyState = struct {
             }
         }
 
-        const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
+        // Connection fds stay bounded by the GLOBAL saturation cap (not N×max),
+        // but each worker adds its own listener + epoll fd — account for that 2×N
+        // overhead so the RLIMIT warning is accurate under the multi-worker model.
+        const effective_needed_fds = requiredFdsForConnections(self.config.max_connections) + 2 * worker_count;
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
         if (self.config.metrics.enabled) {
             try @import("../monitoring.zig").start(self);
         }
 
-        var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
+        if (worker_count <= 1) {
+            // Classic single-threaded path — byte-for-byte the previous behavior.
+            var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd, 0, self.config.max_connections);
+            defer loop.deinit();
+            // Listener bound, epoll + metrics up: tell systemd we're ready
+            // (Type=notify gate). No-op when not under systemd ($NOTIFY_SOCKET unset).
+            sd_notify.ready(self.notify_socket);
+            try loop.run();
+            return;
+        }
+
+        // Split the global connection budget across workers so total slot memory
+        // (and the RAM estimate) stays ~constant regardless of worker count; the
+        // global saturation cap still bounds total active connections. Floor at 64.
+        const per_worker_pool: u32 = @max(@as(u32, 64), self.config.max_connections / @as(u32, @intCast(worker_count)));
+
+        // Multi-worker (SO_REUSEPORT): worker 0 runs on this (main) thread and owns
+        // the signalfd; workers 1..N-1 are spawned threads, each with its OWN
+        // SO_REUSEPORT listener and no signalfd. The kernel load-balances incoming
+        // connections across the N listeners. Shared ProxyState (atomic counters,
+        // mutex-guarded replay cache + middle-proxy snapshot) is read/written by all.
+        log.info("Starting {d} SO_REUSEPORT epoll workers", .{worker_count});
+
+        var extra_servers: [max_workers]net.Server = undefined;
+        var extra_count: usize = 0;
+        var threads: [max_workers]std.Thread = undefined;
+        var thread_count: usize = 0;
+        // Order matters (defers run LIFO): join all worker threads FIRST, then tear
+        // down the listener sockets whose fds those threads were using.
+        defer for (extra_servers[0..extra_count]) |*s| s.deinit(io_ctx);
+        defer for (threads[0..thread_count]) |t| t.join();
+
+        var i: usize = 1;
+        while (i < worker_count) : (i += 1) {
+            const extra = listen_addr.listen(io_ctx, .{
+                .reuse_address = true,
+                .kernel_backlog = @intCast(self.config.backlog),
+            }) catch |err| {
+                log.err("worker {d} listener failed ({any}); continuing with {d} workers", .{ i, err, i });
+                break;
+            };
+            setNonBlocking(extra.socket.handle);
+            // Spawn FIRST; only retain the listener (in extra_servers) once its
+            // worker exists. Otherwise a spawn failure would leave a listenerless
+            // socket in the SO_REUSEPORT group that the kernel still routes
+            // connections to but nobody accepts (they would hang).
+            const t = std.Thread.spawn(.{}, ProxyState.eventLoopWorkerMain, .{ self, extra.socket.handle, i, per_worker_pool }) catch |err| {
+                log.err("worker {d} thread spawn failed ({any}); continuing with {d} workers", .{ i, err, extra_count });
+                var dead = extra;
+                dead.deinit(io_ctx); // remove the listenerless socket from the reuseport group
+                break;
+            };
+            extra_servers[extra_count] = extra;
+            extra_count += 1;
+            threads[thread_count] = t;
+            thread_count += 1;
+        }
+
+        // Worker 0 on the main thread owns the signalfd (signal handling + watchdog).
+        var loop0 = try EventLoop.init(self, server.socket.handle, signal_controller.fd, 0, per_worker_pool);
+        defer loop0.deinit();
+        sd_notify.ready(self.notify_socket);
+        loop0.run() catch |err| {
+            log.err("worker 0 event loop error: {any}", .{err});
+            // Make the other workers drain and exit so we don't leave a half-dead set.
+            self.shutting_down.store(true, .release);
+        };
+    }
+
+    /// Worker thread entry: run a non-signal-owning EventLoop on its own
+    /// SO_REUSEPORT listener. On any failure it sets the shared shutdown flag so
+    /// the rest of the fleet drains rather than running degraded.
+    fn eventLoopWorkerMain(self: *ProxyState, listen_fd: posix.fd_t, worker_id: usize, pool_capacity: u32) void {
+        var loop = EventLoop.init(self, listen_fd, -1, worker_id, pool_capacity) catch |err| {
+            log.err("worker {d} EventLoop.init failed: {any}", .{ worker_id, err });
+            self.shutting_down.store(true, .release);
+            return;
+        };
         defer loop.deinit();
-        try loop.run();
+        loop.run() catch |err| {
+            log.err("worker {d} event loop error: {any}", .{ worker_id, err });
+            self.shutting_down.store(true, .release);
+        };
     }
 
     const MiddleProxySnapshot = middle_proxy_routing.MiddleProxySnapshot;
@@ -1251,12 +1577,55 @@ pub const ProxyState = struct {
     /// active tunnel route (`table 200`), pool state, then configured tunnel
     /// candidates. This keeps the media MP cache warm after tunnel failover.
     fn fetchMiddleProxyAsset(self: *ProxyState, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-        if (fetchUrlBytes(allocator, url)) |bytes| {
-            return bytes;
-        } else |direct_err| {
-            if (self.config.upstream_mode != .tunnel) return direct_err;
-            return self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, direct_err);
+        switch (middleProxyFetchRouteForConfig(&self.config)) {
+            .socks5, .http_connect => {
+                if (self.fetchMiddleProxyAssetViaConfiguredProxy(allocator, url)) |bytes| {
+                    return bytes;
+                } else |proxy_err| {
+                    if (!self.config.allow_direct_fallback) return proxy_err;
+                    log.warn("Middle-proxy asset {s} unavailable through configured upstream ({s}); trying direct fallback", .{
+                        url,
+                        @errorName(proxy_err),
+                    });
+                    return fetchUrlBytes(allocator, url) catch proxy_err;
+                }
+            },
+            .tunnel => {
+                if (fetchUrlBytes(allocator, url)) |bytes| {
+                    return bytes;
+                } else |direct_err| {
+                    return self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, direct_err);
+                }
+            },
+            .direct => return fetchUrlBytes(allocator, url),
         }
+    }
+
+    fn fetchMiddleProxyAssetViaConfiguredProxy(
+        self: *ProxyState,
+        allocator: std.mem.Allocator,
+        url: []const u8,
+    ) ![]u8 {
+        const host = self.config.upstream_proxy_host orelse return error.InvalidProxyUpstreamConfig;
+        if (self.config.upstream_proxy_port == 0) return error.InvalidProxyUpstreamConfig;
+
+        const kind: http_fetch.ProxyKind = switch (self.config.upstream_mode) {
+            .socks5 => .socks5,
+            .http => .http_connect,
+            else => return error.InvalidProxyUpstreamConfig,
+        };
+
+        log.info("Fetching middle-proxy asset {s} through configured {s} upstream", .{
+            url,
+            if (kind == .socks5) "SOCKS5" else "HTTP CONNECT",
+        });
+        return http_fetch.fetchUrlBytesViaProxy(allocator, url, .{
+            .kind = kind,
+            .host = host,
+            .port = self.config.upstream_proxy_port,
+            .username = self.config.upstream_proxy_username,
+            .password = self.config.upstream_proxy_password,
+        });
     }
 
     fn fetchMiddleProxyAssetViaTunnelPool(
@@ -1298,11 +1667,24 @@ pub const ProxyState = struct {
     }
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {
-        // Initial refresh runs before the proxy event loop starts, so on a
-        // censored host it typically fails (tunnel handshake may not be up yet).
-        // Do a short-cycle retry loop early, then fall back to the normal
-        // 24-hour cadence. This gets media MP addresses into the cache within
-        // the first few minutes of uptime instead of the next day.
+        // The INITIAL refresh happens here (in this background thread) so it
+        // never blocks the boot path. On a censored host it may fail (tunnel
+        // handshake may not be up yet), so on failure run a short-cycle retry
+        // loop before falling back to the normal 24-hour cadence. This gets
+        // media MP addresses into the cache within the first few minutes of
+        // uptime instead of the next day, all without delaying startup.
+        var initial_ok = false;
+        if (self.refreshMiddleProxyInfo()) |_| {
+            initial_ok = true;
+        } else |err| {
+            if (isMiddleProxyRefreshNetworkError(err)) {
+                log.info("Initial middle-proxy refresh unavailable ({s}), using bundled defaults", .{@errorName(err)});
+            } else {
+                log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
+            }
+        }
+        if (self.middle_proxy_updater_shutdown.load(.acquire)) return;
+
         const short_retries: [5]u64 = .{
             10 * std.time.ns_per_s,
             30 * std.time.ns_per_s,
@@ -1311,7 +1693,7 @@ pub const ProxyState = struct {
             30 * 60 * std.time.ns_per_s,
         };
         var retry_idx: usize = 0;
-        while (retry_idx < short_retries.len) : (retry_idx += 1) {
+        while (!initial_ok and retry_idx < short_retries.len) : (retry_idx += 1) {
             if (self.waitForUpdaterDelay(short_retries[retry_idx])) return;
             if (self.refreshMiddleProxyInfo()) |_| {
                 break;
@@ -1518,18 +1900,21 @@ const EventLoop = struct {
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
     signal_fd: posix.fd_t,
+    /// 0..N-1; worker 0 owns the signalfd + systemd watchdog. Indexes the shared
+    /// per-worker heartbeat slot.
+    worker_id: usize,
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
     saturation_paused: bool,
     shutting_down: bool,
     shutdown_deadline_ns: i128,
+    /// Monotonic ms of the last systemd WATCHDOG=1 ping (0 = never).
+    last_watchdog_ms: i64 = 0,
     timer_scan_cursor: u32,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
-    subnet_limiter: SubnetRateLimit,
-    flood_guard: *HandshakeFloodGuard,
     // Snapshot of degradation counters for delta logging
     prev_dropped_cap: u64,
     prev_dropped_saturation: u64,
@@ -1543,19 +1928,17 @@ const EventLoop = struct {
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t) !EventLoop {
+    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t, worker_id: usize, pool_capacity: u32) !EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
-
-        const flood_guard = try HandshakeFloodGuard.create(state.allocator);
-        errdefer flood_guard.destroy(state.allocator);
 
         var loop = EventLoop{
             .state = state,
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
             .signal_fd = signal_fd,
-            .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
+            .worker_id = worker_id,
+            .pool = try ConnectionPool.init(state.allocator, pool_capacity),
             .accept_paused = false,
             .accept_resume_ns = 0,
             .saturation_paused = false,
@@ -1565,8 +1948,6 @@ const EventLoop = struct {
             .stats_next_log_ns = nowNs() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
-            .subnet_limiter = SubnetRateLimit.init(),
-            .flood_guard = flood_guard,
             .prev_dropped_cap = 0,
             .prev_dropped_saturation = 0,
             .prev_dropped_rate_limit = 0,
@@ -1582,7 +1963,9 @@ const EventLoop = struct {
         errdefer loop.pool.deinit();
 
         try loop.addFd(listen_fd, true, false);
-        try loop.addFd(signal_fd, true, false);
+        // Only the signal-owning worker has a real signalfd; other SO_REUSEPORT
+        // workers pass -1 and learn about shutdown via state.shutting_down.
+        if (signal_fd >= 0) try loop.addFd(signal_fd, true, false);
         return loop;
     }
 
@@ -1600,7 +1983,6 @@ const EventLoop = struct {
         self.desync_wait_slots.deinit(self.state.allocator);
 
         self.pool.deinit();
-        self.flood_guard.destroy(self.state.allocator);
         closeFd(self.epoll_fd);
     }
 
@@ -1610,6 +1992,24 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = nowNs();
 
         while (true) {
+            // Per-worker liveness heartbeat (this worker's slot), and pet the
+            // systemd watchdog at half the configured interval — ONLY from the
+            // signal owner AND only while EVERY worker is alive, so a wedged
+            // non-owner shard stops the watchdog and triggers a restart.
+            const tick_ms = nowMs();
+            self.state.worker_heartbeats[@min(self.worker_id, max_workers - 1)].store(tick_ms, .monotonic);
+            if (self.signal_fd >= 0 and self.state.watchdog_usec > 0 and
+                tick_ms - self.last_watchdog_ms >= @as(i64, @intCast(self.state.watchdog_usec / 2000)) and
+                self.state.loopAlive(watchdog_stale_ms))
+            {
+                sd_notify.watchdog(self.state.notify_socket);
+                self.last_watchdog_ms = tick_ms;
+            }
+            // Non-owner SO_REUSEPORT workers learn about shutdown via the shared
+            // flag the signal owner sets, so they also stop accepting and drain.
+            if (!self.shutting_down and self.state.shutting_down.load(.acquire)) {
+                self.beginGracefulShutdown("peer shutdown");
+            }
             var current_wait_ms: i32 = event_loop_wait_ms;
             if (self.desync_wait_slots.items.len > 0) {
                 current_wait_ms = @min(current_wait_ms, desync_wait_poll_ms);
@@ -1753,7 +2153,7 @@ const EventLoop = struct {
             accepted_this_round += 1;
 
             const flood_cfg = floodGuardSettings(&self.state.config);
-            if (self.flood_guard.isBlocked(client_addr, flood_cfg)) {
+            if (self.state.floodIsBlocked(client_addr, flood_cfg)) {
                 _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
                 closeFd(cfd);
                 continue;
@@ -1763,9 +2163,9 @@ const EventLoop = struct {
             setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
+            if (!self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
-                _ = self.flood_guard.record(client_addr, .rate_limit, flood_cfg);
+                _ = self.state.floodRecord(client_addr, .rate_limit, flood_cfg);
                 closeFd(cfd);
                 continue;
             }
@@ -1778,34 +2178,30 @@ const EventLoop = struct {
                 continue;
             }
 
-            // Handshake inflight budget: cap at 30% of max_connections.
-            // Prevents churn (scanners/probes) from starving established relay sessions.
-            const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
-            const hs_max = (self.state.config.max_connections * 3) / 10;
-            if (hs_max > 0 and hs_inflight >= hs_max) {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-                _ = self.state.active_connections.fetchSub(1, .monotonic);
-                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
-                _ = self.flood_guard.record(client_addr, .handshake_budget, flood_cfg);
-                closeFd(cfd);
-                continue;
-            }
+            // NOTE: the handshake-inflight budget is charged at FIRST BYTE
+            // (reserveHandshakeBudget in readTlsHeader), not here at accept, so
+            // a flood of silent/zero-byte TCP sessions can no longer exhaust the
+            // budget and starve real handshakes. accept() is still bounded by the
+            // flood guard, per-/24 subnet rate limit, and the active_connections
+            // cap above.
 
             const slot = self.pool.acquire() orelse {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 closeFd(cfd);
                 continue;
             };
 
             slot.active_reserved = true;
+            slot.hs_counted = false;
             slot.traffic_client_to_upstream_counter = &self.state.client_to_upstream_bytes_total;
             slot.traffic_upstream_to_client_counter = &self.state.upstream_to_client_bytes_total;
             slot.user_metrics = null;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
+            slot.client_transport = .fake_tls;
             slot.phase = .reading_tls_header;
+            slot.handshake_pos = 0;
             slot.created_at_ms = nowMs();
             slot.last_activity_ms = slot.created_at_ms;
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
@@ -1896,7 +2292,7 @@ const EventLoop = struct {
 
         var top_entries: [5]HandshakeFloodGuard.TopEntry = undefined;
         const flood_cfg = floodGuardSettings(&self.state.config);
-        const top_len = self.flood_guard.top(flood_cfg, top_entries[0..]);
+        const top_len = self.state.floodTop(flood_cfg, top_entries[0..]);
         if (top_len > 0 and (d_flood + d_rate + d_hs + d_hst > 0 or hs > 0)) {
             var top_buf: [1024]u8 = undefined;
             const top = formatFloodGuardTop(top_entries[0..top_len], &top_buf);
@@ -2019,6 +2415,7 @@ const EventLoop = struct {
         }
 
         self.shutting_down = true;
+        self.state.shutting_down.store(true, .release); // flip /readyz to draining
         self.shutdown_deadline_ns = now_ns + (@as(i128, @intCast(self.state.config.graceful_shutdown_timeout_sec)) * std.time.ns_per_s);
 
         self.modFd(self.listen_fd, false, false) catch |err| {
@@ -2083,6 +2480,14 @@ const EventLoop = struct {
     }
 
     fn reloadConfigFromDisk(self: *EventLoop) void {
+        // With multiple SO_REUSEPORT workers, a live reload would swap and FREE
+        // shared config string slices (tls_domain, mask_target, …) that the other
+        // worker threads read on the handshake hot path — a torn-pointer /
+        // use-after-free data race. Refuse the reload and require a restart.
+        if (self.state.effective_workers > 1) {
+            log.warn("SIGHUP: config reload is not supported with [server].workers>1 ({d} workers); restart to apply changes", .{self.state.effective_workers});
+            return;
+        }
         var next = Config.loadFromFile(self.state.allocator, self.state.config_path) catch |err| {
             log.err("SIGHUP: failed to reload config '{s}': {any}", .{ self.state.config_path, err });
             return;
@@ -2262,6 +2667,7 @@ const EventLoop = struct {
 
         switch (slot.phase) {
             .reading_tls_header => self.readTlsHeader(slot),
+            .reading_direct_obfuscated_handshake => self.readDirectObfuscatedHandshake(slot),
             .reading_client_hello_body => self.readClientHelloBody(slot),
             .reading_mtproto_tls_header, .reading_mtproto_tls_body => self.readMtprotoHandshake(slot),
             .relaying => self.relayClientToUpstream(slot),
@@ -2454,6 +2860,33 @@ const EventLoop = struct {
         self.desync_wait_slots.shrinkRetainingCapacity(write_idx);
     }
 
+    /// Charge a connection against the handshake-inflight budget once it has
+    /// sent its first byte. Returns false (and reverts) if the budget is
+    /// exhausted, in which case the caller must close the slot. The budget caps
+    /// concurrent in-flight handshakes at 30% of max_connections so churn
+    /// (scanners/probes that actually handshake) cannot starve established
+    /// relays. Pre-first-byte sessions are deliberately NOT counted.
+    fn reserveHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) bool {
+        if (slot.hs_counted) return true;
+        const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
+        const hs_max = (self.state.config.max_connections * 3) / 10;
+        if (hs_max > 0 and hs_inflight >= hs_max) {
+            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+            return false;
+        }
+        slot.hs_counted = true;
+        return true;
+    }
+
+    /// Release a connection's handshake-budget slot exactly once (idempotent).
+    fn releaseHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.hs_counted) {
+            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            slot.hs_counted = false;
+        }
+    }
+
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
         while (slot.tls_hdr_pos < tls_header_len) {
             const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
@@ -2467,15 +2900,37 @@ const EventLoop = struct {
             }
             if (slot.first_byte_at_ms == 0) {
                 slot.first_byte_at_ms = nowMs();
+                // First byte arrived → the connection is now actually
+                // handshaking. Charge it against the handshake-inflight budget
+                // here (not at accept) so pre-first-byte silent sessions never
+                // occupied a budget slot. Covers both FakeTLS and the dd path,
+                // which is entered from this function after the TLS sniff.
+                if (!self.reserveHandshakeBudget(slot)) {
+                    self.closeSlot(slot, "handshake budget exhausted");
+                    return;
+                }
             }
             slot.tls_hdr_pos += @intCast(n);
             slot.last_activity_ms = nowMs();
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
-            self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
-                self.closeSlot(slot, "non-tls masked failed");
-            };
+            if (self.state.config.fake_tls_only) {
+                // Strict FakeTLS-only: never accept the non-TLS "direct
+                // obfuscated" (dd) transport. Mask the bytes immediately so a
+                // non-TLS active probe gets the masking cover (matching the old
+                // behavior) instead of being read up to 64 bytes — no dd
+                // transport and no dd active-probe distinguisher.
+                self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
+                    self.closeSlot(slot, "non-tls masked failed");
+                };
+                return;
+            }
+            slot.client_transport = .direct_obfuscated;
+            @memcpy(slot.handshake_buf[0..tls_header_len], slot.tls_hdr_buf[0..]);
+            slot.handshake_pos = tls_header_len;
+            slot.phase = .reading_direct_obfuscated_handshake;
+            self.readDirectObfuscatedHandshake(slot);
             return;
         }
 
@@ -2500,6 +2955,38 @@ const EventLoop = struct {
         slot.tls_body_len = @intCast(record_len);
         slot.tls_body_pos = 0;
         slot.phase = .reading_client_hello_body;
+    }
+
+    fn readDirectObfuscatedHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
+        while (slot.handshake_pos < constants.handshake_len) {
+            const n = posix.read(slot.client_fd, slot.handshake_buf[slot.handshake_pos..]) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeSlot(slot, "direct obfuscated handshake read error");
+                return;
+            };
+            if (n == 0) {
+                // A real dd client sends all 64 obfuscation bytes; a short
+                // non-TLS payload followed by EOF is a probe shape. Serve the
+                // masking cover for whatever was buffered instead of a bare
+                // silent close, so the response matches the masking target
+                // rather than fingerprinting the proxy.
+                self.startMasking(slot, slot.handshake_buf[0..slot.handshake_pos]) catch {
+                    self.closeSlot(slot, "client eof during direct obfuscated handshake");
+                };
+                return;
+            }
+            slot.handshake_pos += @intCast(n);
+            slot.last_activity_ms = nowMs();
+        }
+
+        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, self.state.user_secrets) orelse {
+            self.startMasking(slot, slot.handshake_buf[0..]) catch {
+                self.closeSlot(slot, "bad direct obfuscated handshake");
+            };
+            return;
+        };
+
+        self.finishParsedClientHandshake(slot, result);
     }
 
     fn readClientHelloBody(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2569,12 +3056,43 @@ const EventLoop = struct {
         slot.validation_user_len = @intCast(ulen);
         @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
 
+        // Echo a client-offered cipher in the ServerHello (naturalistic, matches
+        // how a real server negotiates) instead of a constant. Falls back to the
+        // template default when the client offered no parseable TLS 1.3 suite.
+        const client_hello_bytes = slot.clientHelloBuf()[0..slot.client_hello_len];
+
+        // Diagnostic: log the first few real ClientHello fingerprints so an operator
+        // can see what their client actually offers (e.g. whether it presents
+        // X25519MLKEM768) before we match the ServerHello to it. Quiets after the budget.
+        // Saturating decrement: only consume a slot while the budget is > 0, via
+        // cmpxchg, so two SO_REUSEPORT workers racing at value 1 can't both fetchSub
+        // and wrap the u32 past zero (which would keep the counter non-zero forever).
+        const fp_consumed = blk: {
+            var cur = self.state.clienthello_fp_budget.load(.monotonic);
+            while (cur != 0) {
+                if (self.state.clienthello_fp_budget.cmpxchgWeak(cur, cur - 1, .monotonic, .monotonic)) |actual| {
+                    cur = actual; // lost the race — retry with the observed value
+                } else {
+                    break :blk true; // decremented from a positive value
+                }
+            }
+            break :blk false;
+        };
+        if (fp_consumed) {
+            var fp_buf: [256]u8 = undefined;
+            if (tls.formatClientHelloFingerprint(client_hello_bytes, &fp_buf)) |fp| {
+                log.info("client ClientHello [{s}] (we serve: cipher echoes client, key_share=x25519 0x001d)", .{fp});
+            }
+        }
+
+        const echoed_cipher = tls.extractFirstTls13Cipher(client_hello_bytes);
         slot.server_hello = tls.buildServerHelloWithTemplate(
             self.state.allocator,
             self.state.tls_server_hello_template[0..],
             &slot.validation_secret,
             &slot.validation_digest,
             slot.validation_session_id[0..slot.validation_session_id_len],
+            echoed_cipher,
         ) catch {
             self.closeSlot(slot, "build server hello failed");
             return;
@@ -2715,6 +3233,10 @@ const EventLoop = struct {
             return;
         };
 
+        self.finishParsedClientHandshake(slot, result);
+    }
+
+    fn finishParsedClientHandshake(self: *EventLoop, slot: *ConnectionSlot, result: anytype) void {
         slot.obf_params = result.params;
         slot.proto_tag = result.params.proto_tag;
         slot.dc_idx = result.params.dc_idx;
@@ -2864,7 +3386,7 @@ const EventLoop = struct {
                 }
             }
             // Handshake complete (mask path) — release from handshake budget
-            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            self.releaseHandshakeBudget(slot);
             slot.phase = .mask_relaying;
             return;
         }
@@ -2988,6 +3510,10 @@ const EventLoop = struct {
 
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
+        if (slot.client_transport == .direct_obfuscated) {
+            self.relayObfuscatedClientToUpstream(slot);
+            return;
+        }
 
         const mp_c2s_scratch = if (slot.middle_ctx != null)
             self.ensureMpC2sScratch() catch {
@@ -3013,6 +3539,10 @@ const EventLoop = struct {
 
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
+        if (slot.client_transport == .direct_obfuscated) {
+            self.relayObfuscatedUpstreamToClient(slot);
+            return;
+        }
 
         const mp_s2c_scratch = if (slot.middle_ctx != null)
             self.ensureMpS2cScratch() catch {
@@ -3034,6 +3564,97 @@ const EventLoop = struct {
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = nowMs();
         }
+    }
+
+    fn relayObfuscatedClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
+        const n = posix.read(slot.client_fd, self.shared_read_buf[0..]) catch |err| {
+            if (err == error.WouldBlock) return;
+            self.closeSlot(slot, "direct obfuscated c2s read error");
+            return;
+        };
+        if (n == 0) {
+            self.closeSlot(slot, "direct obfuscated c2s eof");
+            return;
+        }
+
+        const payload = self.shared_read_buf[0..n];
+        if (slot.client_decryptor) |*dec| dec.apply(payload);
+
+        if (slot.middle_ctx) |*mp| {
+            const scratch = self.ensureMpC2sScratch() catch {
+                self.closeSlot(slot, "alloc middleproxy c2s scratch failed");
+                return;
+            };
+            const out_data = mp.encapsulateC2S(payload, scratch) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy c2s failed");
+                return;
+            };
+            if (out_data.len > 0) {
+                _ = proxyHandshakeQueueUpstream(self, slot, out_data) catch {
+                    self.closeSlot(slot, "direct obfuscated c2s queue failed");
+                    return;
+                };
+            }
+        } else if (slot.tg_encryptor) |*enc| {
+            enc.apply(payload);
+            _ = proxyHandshakeQueueUpstream(self, slot, payload) catch {
+                self.closeSlot(slot, "direct obfuscated c2s queue failed");
+                return;
+            };
+        } else {
+            // No encapsulation/encryptor wired up: forwarding here would silently
+            // black-hole decrypted client data while still counting it. The dd
+            // path only reaches .relaying after dc_nonce/middleProxyBegin set one
+            // of these, so this is unreachable today — fail loudly if it changes.
+            self.closeSlot(slot, "direct obfuscated c2s missing encryptor/middle_ctx");
+            return;
+        }
+
+        slot.c2s_bytes += payload.len;
+        slot.last_activity_ms = nowMs();
+    }
+
+    fn relayObfuscatedUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
+        const n = posix.read(slot.upstream_fd, self.shared_read_buf[0..]) catch |err| {
+            if (err == error.WouldBlock) return;
+            self.closeSlot(slot, "direct obfuscated s2c read error");
+            return;
+        };
+        if (n == 0) {
+            self.closeSlot(slot, "direct obfuscated s2c eof");
+            return;
+        }
+
+        const raw = self.shared_read_buf[0..n];
+        if (slot.middle_ctx) |*mp| {
+            const scratch = self.ensureMpS2cScratch() catch {
+                self.closeSlot(slot, "alloc middleproxy s2c scratch failed");
+                return;
+            };
+            const payload = mp.decapsulateS2C(raw, scratch) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy s2c failed");
+                return;
+            };
+            if (payload.len == 0) return;
+            if (slot.client_encryptor) |*enc| enc.apply(payload);
+            _ = relayQueueClient(self, slot, payload) catch {
+                self.closeSlot(slot, "direct obfuscated s2c queue failed");
+                return;
+            };
+            slot.s2c_bytes += payload.len;
+        } else {
+            if (!slot.use_fast_mode) {
+                if (slot.tg_decryptor) |*dec| dec.apply(raw);
+                if (slot.client_encryptor) |*enc| enc.apply(raw);
+            }
+            _ = relayQueueClient(self, slot, raw) catch {
+                self.closeSlot(slot, "direct obfuscated s2c queue failed");
+                return;
+            };
+            slot.s2c_bytes += raw.len;
+        }
+
+        slot.last_activity_ms = nowMs();
     }
 
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3146,9 +3767,22 @@ const EventLoop = struct {
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
+                } else if (slot.phase == .reading_direct_obfuscated_handshake and
+                    now_ms - slot.first_byte_at_ms > dd_handshake_decision_ms)
+                {
+                    // A non-TLS (dd) connection that hasn't completed its 64-byte
+                    // handshake shortly after the first byte is almost certainly a
+                    // probe. Serve the masking cover now instead of waiting out the
+                    // full handshake_timeout and then closing silently — this makes
+                    // the response match the masking target and shrinks the active-
+                    // probe timing oracle. Falls back to close if masking is off.
+                    self.startMasking(slot, slot.handshake_buf[0..slot.handshake_pos]) catch {
+                        self.closeSlot(slot, "dd handshake decision timeout");
+                    };
+                    continue;
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
-                    _ = self.flood_guard.record(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
+                    _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
@@ -3176,6 +3810,7 @@ const EventLoop = struct {
 
         switch (slot.phase) {
             .reading_tls_header,
+            .reading_direct_obfuscated_handshake,
             .reading_client_hello_body,
             .reading_mtproto_tls_header,
             .reading_mtproto_tls_body,
@@ -3322,13 +3957,17 @@ const EventLoop = struct {
             if (user_metrics) |entry| {
                 _ = entry.connections_active.fetchSub(1, .monotonic);
             }
-            // If connection was still in handshake phase, release from handshake budget
-            if (slot.handshakeInProgress()) {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-            }
+            // RED errors + evasion signal: bucket the close reason once per slot.
+            _ = self.state.close_reasons[@intFromEnum(CloseReason.classify(reason))].fetchAdd(1, .monotonic);
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
+        // Release the handshake-budget slot exactly once, keyed on hs_counted
+        // (set at first byte). Pre-first-byte sessions were never counted, and
+        // relay/mask completion already released, so this is a no-op in those
+        // cases and avoids both leaks and underflow.
+        self.releaseHandshakeBudget(slot);
+        // Reclaim retired user-metrics whose connections have now drained (#302).
         self.state.collectRetiredUserMetrics();
 
         slot.desync_wait_enqueued = false;
