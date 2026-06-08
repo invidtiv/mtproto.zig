@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DOCKERFILE="$ROOT/test/installer-e2e/Dockerfile"
 LOG_DIR="${MTPROTO_INSTALLER_E2E_LOG_DIR:-$ROOT/test/installer-e2e/logs}"
-IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:12 ubuntu:24.04}"
+IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:11 debian:12 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04}"
 VERSION="${MTPROTO_INSTALLER_E2E_VERSION:-latest}"
 PORT="${MTPROTO_INSTALLER_E2E_PORT:-443}"
 # Default to the shipped installer default (rutube.ru), not the domain the installer
@@ -133,6 +133,12 @@ verify_install_once() {
     test -x /usr/local/bin/mtbuddy
     test "$(readlink -f /usr/bin/mtbuddy)" = /usr/local/bin/mtbuddy
     command -v mtbuddy >/dev/null
+
+    # The release is downloaded with signature verification, so minisign MUST have been
+    # acquired (apt package, or the pinned upstream fallback on hosts like Ubuntu 20.04
+    # whose apt has no minisign). A missing minisign here would mean the install fell
+    # through to an unsigned / fail-open path.
+    command -v minisign >/dev/null
 
     test -x /opt/mtproto-proxy/mtproto-proxy
     test -f /opt/mtproto-proxy/config.toml
