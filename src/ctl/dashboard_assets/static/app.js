@@ -2,27 +2,47 @@
 
 const $ = id => document.getElementById(id);
 
+// ── Icon set (inline SVG, currentColor, 24×24, butt caps / miter joins, angular
+// Zig-echo geometry) — replaces every emoji used as an icon. ──
+const ICON = {
+  'qr-share': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M3 3 H9 V9 H3 Z"/><path d="M15 3 H21 V9 H15 Z"/><path d="M3 15 H9 V21 H3 Z"/><path d="M15 15 H18 V18 H15 Z"/><path d="M21 15 V21 H18"/><path d="M15 21 H15.01"/></svg>',
+  'copy': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M9 9 H20 V20 H9 Z"/><path d="M5 15 H4 V4 H15 V5"/></svg>',
+  'delete': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M4 6 H20"/><path d="M9 6 V4 H15 V6"/><path d="M6 6 L7 20 H17 L18 6"/><path d="M10 10 V16 M14 10 V16"/></svg>',
+  'plus': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 5 V19 M5 12 H19"/></svg>',
+  'chevron-down': '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><polyline points="7,10 12,15 17,10"/></svg>',
+  'pause': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M8 5 V19 M16 5 V19"/></svg>',
+  'play': '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5 L19 12 L7 19 Z"/></svg>',
+  'search': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M5 5 H15 V15 H5 Z"/><path d="M15 15 L20 20"/></svg>',
+  'autoscroll': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><polyline points="6,5 12,11 18,5"/><polyline points="6,11 12,17 18,11"/><path d="M5 20 H19"/></svg>',
+  'jump-latest': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 4 V16"/><polyline points="6,11 12,17 18,11"/><path d="M5 20 H19"/></svg>',
+  'arrow-down': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 4 V18"/><polyline points="6,12 12,18 18,12"/></svg>',
+  'arrow-up': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 20 V6"/><polyline points="6,12 12,6 18,12"/></svg>',
+  'warning': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 3 L22 20 H2 Z"/><path d="M12 10 V15"/><path d="M12 17.5 V17.6"/></svg>',
+  'send-plane': '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M21 3 L3 11 L10 13 L12 20 Z"/><path d="M21 3 L10 13"/></svg>',
+  'lang-globe': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M4 6 H20 V18 H4 Z"/><path d="M4 12 H20"/><path d="M12 6 C9 9 9 15 12 18 C15 15 15 9 12 6 Z"/></svg>'
+};
+
 // ── i18n (EN/RU) ──────────────────────────────────────────────
 // Prose, labels and buttons are translated; technical proper nouns (MiddleProxy,
 // socks5, Nginx, RX/TX) stay as-is — that's normal bilingual UI, not code-switching.
 const I18N = {
   en: {
     'header.refresh': 'Refresh', 'header.uptime': 'Uptime', 'header.lastUpdate': 'Last update',
-    'card.cpu': '⬡ CPU', 'card.cpuSub': 'utilization', 'card.memory': '◈ Memory', 'card.network': '◎ Network Throughput',
+    'card.cpu': 'CPU', 'card.cpuSub': 'utilization', 'card.memory': 'Memory', 'card.network': 'Network Throughput',
     'stats.activeOf': 'Active /', 'stats.handshakes': 'Handshakes', 'stats.total': 'Total Connections',
-    'users.title': '👥 Users', 'users.add': '+ Add User', 'users.who': 'Who is this for?',
+    'users.title': 'Users', 'users.add': '+ Add User', 'users.who': 'Who is this for?',
     'users.secret': 'Secret', 'users.secretHint': '(leave empty to auto-generate)',
-    'users.namePh': 'e.g. Мама, dad, work 💼', 'users.secretPh': "Leave blank — we'll create one for you",
+    'users.namePh': 'e.g. Мама, dad, work', 'users.secretPh': "Leave blank — we'll create one for you",
     'btn.create': 'Create', 'btn.cancel': 'Cancel', 'btn.apply': 'Apply', 'btn.pin': 'Pin', 'btn.setTarget': 'Set target', 'btn.delete': 'Delete', 'btn.close': 'Close',
     'routing.title': 'Routing & Upstream', 'routing.upstream': 'Upstream', 'routing.tunnelPin': 'Tunnel pin',
     'routing.proxyHost': 'Proxy host', 'routing.port': 'Port', 'routing.user': 'User', 'routing.pass': 'Pass', 'routing.target': 'Target', 'routing.policy': 'Policy',
-    'mask.title': 'Masking Health', 'mask.mode': 'Mode', 'mask.endpoint': 'Endpoint', 'mask.timer': 'Health Timer',
+    'mask.title': 'Masking', 'mask.mode': 'Mode', 'mask.endpoint': 'Endpoint', 'mask.timer': 'Health Timer',
     'egress.title': 'Tunnel Quality', 'egress.interface': 'Interface', 'egress.status': 'Status',
     'egress.rtt': 'RTT', 'egress.loss': 'Loss', 'egress.handshake': 'Handshake', 'egress.quality': 'Quality',
     'egress.good': 'Good', 'egress.degraded': 'Degraded', 'egress.poor': 'Poor', 'egress.up': 'Up', 'egress.down': 'Down', 'egress.unknown': 'Unknown',
     'egress.primary': 'primary', 'egress.bottleneck': 'Tunnel is the bottleneck',
     'egress.notMonitored': 'Not monitored (not in tunnel mode)',
-    'logs.title': '▸ Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
+    'logs.title': 'Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
     'modal.deleteUser': 'Delete User', 'modal.deleteTunnel': 'Delete Tunnel', 'modal.restartNote': 'The proxy will be restarted to apply changes.',
     'share.subtitle': 'Point their phone camera at this code to connect.', 'share.copyLink': 'Copy link', 'share.send': 'Send', 'share.with': 'Share with',
     'status.online': 'Online', 'status.offline': 'Offline', 'status.stuck': 'Stuck',
@@ -31,17 +51,19 @@ const I18N = {
     'hero.stalled': 'Your proxy is running but not responding — it looks stuck. Restarting usually fixes this.',
     'hero.idle': 'Your proxy is online and ready. No one is connected yet — share a link to get started.',
     'hero.busy': "Everything's working. {n} connected right now.",
+    'hero.vChecking': 'Checking…', 'hero.vOffline': 'Offline', 'hero.vStalled': 'Stalled', 'hero.vIdle': 'All quiet — idle', 'hero.vBusy': 'Busy — {n} connected',
+    'hero.connected': 'Connected', 'hero.uptimeLbl': 'Uptime',
     'toast.connected': 'Someone just connected through your proxy.',
     'toast.linkCopied': 'Link copied — send it to someone you love.',
     'autoscroll.on': 'Auto-scroll: on', 'autoscroll.off': 'Auto-scroll: off', 'btn.pause': 'Pause', 'btn.resume': 'Resume',
   },
   ru: {
     'header.refresh': 'Обновление', 'header.uptime': 'Аптайм', 'header.lastUpdate': 'Обновлено',
-    'card.cpu': '⬡ CPU', 'card.cpuSub': 'загрузка', 'card.memory': '◈ Память', 'card.network': '◎ Сетевой трафик',
+    'card.cpu': 'CPU', 'card.cpuSub': 'загрузка', 'card.memory': 'Память', 'card.network': 'Сетевой трафик',
     'stats.activeOf': 'Активно /', 'stats.handshakes': 'Подключаются', 'stats.total': 'Всего подключений',
-    'users.title': '👥 Пользователи', 'users.add': '+ Добавить', 'users.who': 'Для кого это?',
+    'users.title': 'Пользователи', 'users.add': '+ Добавить', 'users.who': 'Для кого это?',
     'users.secret': 'Секрет', 'users.secretHint': '(пусто — сгенерируем сами)',
-    'users.namePh': 'напр. Мама, папа, работа 💼', 'users.secretPh': 'Оставьте пустым — создадим сами',
+    'users.namePh': 'напр. Мама, папа, работа', 'users.secretPh': 'Оставьте пустым — создадим сами',
     'btn.create': 'Создать', 'btn.cancel': 'Отмена', 'btn.apply': 'Применить', 'btn.pin': 'Закрепить', 'btn.setTarget': 'Задать', 'btn.delete': 'Удалить', 'btn.close': 'Закрыть',
     'routing.title': 'Маршрутизация и выход', 'routing.upstream': 'Выход', 'routing.tunnelPin': 'Туннель',
     'routing.proxyHost': 'Хост прокси', 'routing.port': 'Порт', 'routing.user': 'Логин', 'routing.pass': 'Пароль', 'routing.target': 'Цель', 'routing.policy': 'Политика',
@@ -51,7 +73,7 @@ const I18N = {
     'egress.good': 'Хорошо', 'egress.degraded': 'Деградация', 'egress.poor': 'Плохо', 'egress.up': 'Включён', 'egress.down': 'Отключён', 'egress.unknown': 'Неизвестно',
     'egress.primary': 'основной', 'egress.bottleneck': 'Туннель — узкое место',
     'egress.notMonitored': 'Не отслеживается (не режим туннеля)',
-    'logs.title': '▸ Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
+    'logs.title': 'Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
     'modal.deleteUser': 'Удалить пользователя', 'modal.deleteTunnel': 'Удалить туннель', 'modal.restartNote': 'Прокси будет перезапущен для применения изменений.',
     'share.subtitle': 'Наведите камеру их телефона на этот код, чтобы подключиться.', 'share.copyLink': 'Скопировать ссылку', 'share.send': 'Отправить', 'share.with': 'Поделиться с',
     'status.online': 'Онлайн', 'status.offline': 'Офлайн', 'status.stuck': 'Завис',
@@ -60,18 +82,25 @@ const I18N = {
     'hero.stalled': 'Прокси запущен, но не отвечает — похоже, завис. Обычно помогает перезапуск.',
     'hero.idle': 'Прокси онлайн и готов. Пока никто не подключён — поделитесь ссылкой, чтобы начать.',
     'hero.busy': 'Всё работает. Сейчас подключено: {n}.',
+    'hero.vChecking': 'Проверка…', 'hero.vOffline': 'Офлайн', 'hero.vStalled': 'Завис', 'hero.vIdle': 'Тишина — простой', 'hero.vBusy': 'Активно — {n} на связи',
+    'hero.connected': 'Подключено', 'hero.uptimeLbl': 'Аптайм',
     'toast.connected': 'Кто-то только что подключился через ваш прокси.',
     'toast.linkCopied': 'Ссылка скопирована — отправьте близкому.',
     'autoscroll.on': 'Автопрокрутка: вкл', 'autoscroll.off': 'Автопрокрутка: выкл', 'btn.pause': 'Пауза', 'btn.resume': 'Продолжить',
   },
 };
-let LANG = localStorage.getItem('dashLang') || ((navigator.language || '').toLowerCase().startsWith('ru') ? 'ru' : 'en');
+let LANG = localStorage.getItem('dashLang') || 'en';
 function t(k) { return (I18N[LANG] && I18N[LANG][k]) || (I18N.en && I18N.en[k]) || k; }
 function applyStaticI18n() {
   document.documentElement.setAttribute('lang', LANG);
   document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.getAttribute('data-i18n')); });
   document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph'))); });
-  const tg = $('langToggle'); if (tg) tg.textContent = (LANG === 'ru') ? 'EN' : 'RU';
+  const tg = $('langToggle');
+  if (tg) {
+    const cells = tg.querySelectorAll('.lang-cell');
+    if (cells.length) cells.forEach((c) => c.classList.toggle('on', c.dataset.lang === LANG));
+    else tg.textContent = (LANG === 'ru') ? 'EN' : 'RU';
+  }
 }
 function setLang(l) { LANG = (l === 'ru') ? 'ru' : 'en'; localStorage.setItem('dashLang', LANG); applyStaticI18n(); }
 const MH = 90;       // max history points
@@ -130,10 +159,30 @@ const logFilters = { error: true, warn: true, stats: true };
 let logSearchTerm = '';
 const appRoot = document.querySelector('.app');
 
+function formatHistoryWindowLabel() {
+  const seconds = Math.round((MH * pollIntervalMs) / 1000);
+  if (seconds >= 240) return 'LAST ' + Math.round(seconds / 60) + 'M';
+  if (seconds >= 90) return 'LAST ' + Math.round(seconds / 60) + ' MIN';
+  return 'LAST ' + seconds + 'S';
+}
+
+function updateNetworkWindowLabel() {
+  const el = document.querySelector('.net-window');
+  if (el) el.textContent = formatHistoryWindowLabel();
+}
+
 // ── Gauges ──
 function setGauge(arcId, pctId, val) {
-  $(arcId).style.strokeDashoffset = 94.2 - (94.2 * val / 100);
-  $(pctId).textContent = val + '%';
+  // 270° arc (gap at the bottom) on a r=15 circle: full circumference ≈ 94.25,
+  // 270° ≈ 70.69. The arc is rotated -via CSS- so the gap sits at 6 o'clock.
+  const ARC = 70.69;
+  const v = Math.max(0, Math.min(100, Number(val) || 0));
+  $(arcId).style.strokeDasharray = (ARC * v / 100).toFixed(2) + ' 94.25';
+  // Signal-threshold colour ramp — the full-saturation amber stays reserved for
+  // the status hero, so the dial earns its colour from the value band instead.
+  const col = v < 60 ? 'var(--signal-go)' : (v < 85 ? 'var(--signal-caution)' : 'var(--signal-stop)');
+  $(arcId).style.stroke = col;
+  $(pctId).textContent = val;   // unit "%" is a separate .gauge-unit element
 }
 
 // ── Network chart ──
@@ -151,6 +200,8 @@ window.addEventListener('resize', resizeCanvas);
 
 function drawNetChart() {
   if (!lastData || !lastData.net_history) return;
+  resizeCanvas();   // self-size each draw (like the sparklines) so the chart is
+                    // robust to first-paint timing and container width changes
   const data = lastData.net_history;
   const w = canvas.width / 2, h = canvas.height / 2;
   ctx.clearRect(0, 0, w, h);
@@ -178,7 +229,7 @@ function drawNetChart() {
   for (let i = 0; i <= 4; i++) {
     const frac = i / 4;
     const y = PAD_TOP + ch * (1 - frac);
-    ctx.strokeStyle = 'rgba(247,164,29,0.05)';
+    ctx.strokeStyle = 'rgba(39,47,56,0.8)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     ctx.moveTo(PAD, y);
@@ -229,12 +280,12 @@ function drawNetChart() {
   }
 
   drawLine('tx', 'rgb(247,164,29)');
-  drawLine('rx', 'rgb(52,211,153)');
+  drawLine('rx', 'rgb(92,130,201)');
 }
 
 canvas.addEventListener('mousemove', e => {
   showTooltip(e, canvas, 42, lastData?.net_history, item => 
-    `<div class="tooltip-val" style="color:var(--green)">RX: ${fmt(item.rx)}</div><div class="tooltip-val" style="color:var(--zig)">TX: ${fmt(item.tx)}</div>`
+    `<div class="tooltip-val" style="color:var(--blue)">RX: ${fmt(item.rx)}</div><div class="tooltip-val" style="color:var(--zig)">TX: ${fmt(item.tx)}</div>`
   );
 });
 canvas.addEventListener('mouseleave', hideTooltip);
@@ -261,7 +312,7 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   }
   peak *= 1.2;
 
-  const PAD = 32;       // left padding
+  const PAD = 2;        // no axis labels (Paper-clean trace) → minimal left gutter
   const PAD_TOP = 6;    // top padding
   const cw = w - PAD;
   const ch = h - PAD_TOP;
@@ -270,26 +321,14 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
 
   x.clearRect(0, 0, w, h);
 
-  // Y-axis ticks
-  const ticks = unit === '%' ? [0, 50, 100] : [0, peak * 0.5, peak];
-  x.font = '8px Inter, sans-serif';
-  x.textAlign = 'right';
-  x.textBaseline = 'middle';
-
-  for (const tv of ticks) {
-    const frac = tv / peak;
-    const y = PAD_TOP + ch * (1 - frac);
-    x.strokeStyle = 'rgba(247,164,29,0.05)';
-    x.lineWidth = 0.5;
-    x.beginPath();
-    x.moveTo(PAD, y);
-    x.lineTo(w, y);
-    x.stroke();
-    if (tv > 0) {
-      x.fillStyle = 'rgba(124,134,152,0.5)';
-      x.fillText(unit === '%' ? tv + '%' : tv.toFixed(0), PAD - 4, y);
-    }
-  }
+  // Paper sparkline: a clean seismograph trace with one faint baseline rule —
+  // no Y-axis ticks/labels (those "100%/50%" marks floated in the empty cell).
+  x.strokeStyle = 'rgba(39,47,56,0.8)';
+  x.lineWidth = 1;
+  x.beginPath();
+  x.moveTo(PAD, PAD_TOP + ch);
+  x.lineTo(w, PAD_TOP + ch);
+  x.stroke();
 
   // Data line
   x.beginPath();
@@ -317,12 +356,12 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
 
 const cpuCanvas = $('cpuSpark');
 if (cpuCanvas) {
-  cpuCanvas.addEventListener('mousemove', e => showTooltip(e, cpuCanvas, 32, lastData?.cpu_history, item => `<div class="tooltip-val" style="color:var(--zig)">Util: ${item.v}%</div>`));
+  cpuCanvas.addEventListener('mousemove', e => showTooltip(e, cpuCanvas, 32, lastData?.cpu_history, item => `<div class="tooltip-val" style="color:var(--text)">Util: ${item.v}%</div>`));
   cpuCanvas.addEventListener('mouseleave', hideTooltip);
 }
 const memCanvas = $('memSpark');
 if (memCanvas) {
-  memCanvas.addEventListener('mousemove', e => showTooltip(e, memCanvas, 32, lastData?.mem_history, item => `<div class="tooltip-val" style="color:var(--purple)">Mem: ${item.v}%</div>`));
+  memCanvas.addEventListener('mousemove', e => showTooltip(e, memCanvas, 32, lastData?.mem_history, item => `<div class="tooltip-val" style="color:var(--text)">Mem: ${item.v}%</div>`));
   memCanvas.addEventListener('mouseleave', hideTooltip);
 }
 
@@ -399,29 +438,27 @@ function showToast(msg, type) {
 // One plain-language verdict at the top of the page — the answer to the only
 // question most people open the dashboard to ask: "is everything OK?"
 function setStatusHero(online, active, state) {
-  const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText');
+  const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText'), sub = $('statusHeroSub');
   if (!el) return;
+  // Paper hero: fixed surface-1 panel; only the signal square (#statusHeroIcon,
+  // background:currentColor) + verdict take the state colour. Short verdict on top,
+  // descriptive sub-line beneath (the right-side figures are filled in poll()).
+  el.style.background = '';
+  if (icon) icon.textContent = '';
+  let color, signalColor, verdict, subline;
   if (!online) {
-    el.style.background = 'rgba(255,80,80,0.10)';
-    el.style.color = 'var(--red,#ff6b6b)';
-    icon.textContent = '✖';
-    txt.textContent = t('hero.offline');
+    color = 'var(--signal-stop)'; signalColor = color; verdict = t('hero.vOffline'); subline = t('hero.offline');
   } else if (state === 'stalled') {
-    el.style.background = 'rgba(240,180,40,0.12)';
-    el.style.color = 'var(--amber,#f0b428)';
-    icon.textContent = '!';
-    txt.textContent = t('hero.stalled');
+    color = 'var(--signal-caution)'; signalColor = color; verdict = t('hero.vStalled'); subline = t('hero.stalled');
   } else if (active > 0) {
-    el.style.background = 'rgba(80,220,120,0.10)';
-    el.style.color = 'var(--green,#46d369)';
-    icon.textContent = '✓';
-    txt.textContent = t('hero.busy').replace('{n}', active);
+    color = 'var(--accent)'; signalColor = 'var(--signal-go)'; verdict = t('hero.vBusy').replace('{n}', active); subline = t('hero.busy').replace('{n}', active);
   } else {
-    el.style.background = 'rgba(80,220,120,0.08)';
-    el.style.color = 'var(--green,#46d369)';
-    icon.textContent = '✓';
-    txt.textContent = t('hero.idle');
+    color = 'var(--signal-go)'; signalColor = color; verdict = t('hero.vIdle'); subline = t('hero.idle');
   }
+  el.style.color = color;
+  el.style.setProperty('--hero-signal-color', signalColor);
+  txt.textContent = verdict;
+  if (sub) sub.textContent = subline;
 }
 
 // The "share with someone you love" moment: a scannable QR + one-tap send.
@@ -723,14 +760,14 @@ function renderUsers(users, perUserActive, proxyStats) {
       : '<button class="ui-btn user-direct-toggle" type="button" data-user="' + userName + '" data-direct="true" title="Switch to direct route">default</button>');
 
     return '<div class="' + rowClass + '">' +
-      '<div class="user-name">' + toggleSwitch + displayName + sessionsBadge + '</div>' +
+      '<div class="user-name">' + toggleSwitch + '<span class="user-name-text">' + displayName + '</span>' + sessionsBadge + '</div>' +
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
-      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + '>📲 Share</button>' +
-      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + '>Copy tg://</button>' +
-      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + '>Copy t.me</button>' +
-      '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
+      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + ' title="Share via QR">' + ICON['qr-share'] + '</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + ' title="Copy tg:// link">tg://</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + ' title="Copy t.me link">t.me</button>' +
+      '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">' + ICON['delete'] + '</button>' +
       '</div>' +
       '</div>';
   }).join('');
@@ -793,6 +830,19 @@ function setRoutingAction(msg, cls) {
   note.className = 'routing-action-note' + (cls ? (' ' + cls) : '');
 }
 
+function setMiddleProxyButton(enabled, pending) {
+  const middleBtn = $('routingMiddleBtn');
+  if (!middleBtn) return;
+  const on = Boolean(enabled);
+  const label = middleBtn.querySelector('.routing-toggle-text');
+  if (label) label.textContent = on ? 'On' : 'Off';
+  else middleBtn.textContent = on ? 'On' : 'Off';
+  middleBtn.classList.toggle('active', on);
+  middleBtn.classList.toggle('is-pending', Boolean(pending));
+  middleBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  middleBtn.setAttribute('aria-busy', pending ? 'true' : 'false');
+}
+
 function setupRoutingControls() {
   const middleBtn = $('routingMiddleBtn');
   const upstreamSelect = $('routingUpstreamSelect');
@@ -806,24 +856,47 @@ function setupRoutingControls() {
   const proxyApply = $('routingProxyApply');
   if (!middleBtn || !upstreamSelect || !upstreamApply) return;
 
-  middleBtn.addEventListener('click', async () => {
-    if (!currentRouting) return;
+  async function commitMiddleProxyToggle() {
+    if (!currentRouting || middleBtn.dataset.pending === '1') return;
 
-    const target = !Boolean(currentRouting.middle_proxy_enabled);
-    middleBtn.disabled = true;
-    setRoutingAction('Updating middle proxy mode…');
+    const previous = Boolean(currentRouting.middle_proxy_enabled);
+    const target = !previous;
+    middleBtn.dataset.pending = '1';
+    middleBtn.dataset.target = target ? '1' : '0';
+    currentRouting.middle_proxy_enabled = target;
+    setMiddleProxyButton(target, true);
+    setRoutingAction('');
 
     try {
       const data = await apiCall('/api/routing/middle', { enabled: target });
+      currentRouting.middle_proxy_enabled = Boolean(data.enabled);
+      setMiddleProxyButton(currentRouting.middle_proxy_enabled, false);
       setRoutingAction('MiddleProxy ' + (data.enabled ? 'enabled' : 'disabled') + '. Proxy restarted.', 'ok');
       showToast('MiddleProxy ' + (data.enabled ? 'enabled' : 'disabled') + '. Proxy restarted.', 'success');
       await runPoll();
     } catch (e) {
+      currentRouting.middle_proxy_enabled = previous;
+      setMiddleProxyButton(previous, false);
       setRoutingAction('Failed: ' + e.message, 'error');
       showToast('Failed: ' + e.message, 'error');
     } finally {
-      middleBtn.disabled = false;
+      delete middleBtn.dataset.pending;
+      delete middleBtn.dataset.target;
+      setMiddleProxyButton(Boolean(currentRouting && currentRouting.middle_proxy_enabled), false);
     }
+  }
+
+  middleBtn.addEventListener('pointerdown', (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    event.preventDefault();
+    middleBtn.focus({ preventScroll: true });
+    void commitMiddleProxyToggle();
+  });
+
+  middleBtn.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    void commitMiddleProxyToggle();
   });
 
   upstreamApply.addEventListener('click', async () => {
@@ -854,6 +927,9 @@ function setupRoutingControls() {
       upstreamApply.disabled = false;
       upstreamSelect.disabled = false;
     }
+  });
+  upstreamSelect.addEventListener('change', () => {
+    if (!upstreamApply.disabled) upstreamApply.click();
   });
 
   if (tunnelIfaceApply && tunnelIfaceSelect) {
@@ -886,6 +962,9 @@ function setupRoutingControls() {
         tunnelIfaceApply.disabled = false;
         tunnelIfaceSelect.disabled = false;
       }
+    });
+    tunnelIfaceSelect.addEventListener('change', () => {
+      if (!tunnelIfaceApply.disabled) tunnelIfaceApply.click();
     });
   }
 
@@ -957,9 +1036,9 @@ function renderRouting(routing) {
 
   const middleBtn = $('routingMiddleBtn');
   if (middleBtn) {
-    const enabled = Boolean(routing.middle_proxy_enabled);
-    middleBtn.textContent = enabled ? 'MiddleProxy: ON' : 'MiddleProxy: OFF';
-    middleBtn.classList.toggle('active', enabled);
+    const pending = middleBtn.dataset.pending === '1';
+    const pendingTarget = middleBtn.dataset.target === '1';
+    setMiddleProxyButton(pending ? pendingTarget : Boolean(routing.middle_proxy_enabled), pending);
   }
 
   const upstreamSelect = $('routingUpstreamSelect');
@@ -977,7 +1056,12 @@ function renderRouting(routing) {
       const choices = Array.isArray(routing.tunnel_pool)
         ? routing.tunnel_pool
         : [];
-      const selectedIface = String(routing.pinned_tunnel_interface || '');
+      const selectedIface = String(
+        routing.pinned_tunnel_interface ||
+        routing.active_tunnel_interface ||
+        routing.selected_tunnel_interface ||
+        ''
+      );
       const seen = new Set();
       const options = [''];
 
@@ -1058,14 +1142,28 @@ function renderRouting(routing) {
 
   $('routingMiddle').textContent = routing.middle_proxy_enabled ? 'enabled' : 'disabled';
   $('routingUpstream').textContent = upstreamType || '—';
-  $('routingTarget').textContent = routing.upstream_target || '—';
+  const tunnelTarget = routing.primary_tunnel && routing.primary_tunnel.endpoint
+    ? routing.primary_tunnel.endpoint
+    : '';
+  $('routingTarget').textContent = (upstreamType === 'tunnel' && tunnelTarget)
+    ? tunnelTarget
+    : (routing.upstream_target || '—');
 
   const policy = routing.policy || {};
+  const poolTotal = Array.isArray(routing.tunnel_pool)
+    ? routing.tunnel_pool.length
+    : Number(routing.detected_tunnels || 0);
+  const poolHealthy = Number(
+    routing.healthy_tunnels != null
+      ? routing.healthy_tunnels
+      : (routing.active_tunnels != null ? routing.active_tunnels : 0)
+  );
+  const poolTxt = poolTotal > 0 ? (poolHealthy + '/' + poolTotal) : routing.pool_status;
   const policyTxt = (policy.rule_ok ? 'rule ok' : 'rule missing') +
-    ' · ' +
-    (policy.route_ok ? ('route ok' + (policy.route_dev ? (' (' + policy.route_dev + ')') : '')) : 'route missing') +
-    (routing.pool_status ? (' · pool ' + routing.pool_status) : '');
-  $('routingPolicy').textContent = policyTxt;
+    (poolTxt
+      ? (' · pool ' + poolTxt)
+      : (' · ' + (policy.route_ok ? 'route ok' : 'route missing')));
+  $('routingPolicy').innerHTML = '<span class="signal-sq"></span>' + esc(policyTxt);
 
   const list = $('routingTunnelsList');
   const tunnels = Array.isArray(routing.tunnels) ? routing.tunnels : [];
@@ -1099,18 +1197,20 @@ function renderRouting(routing) {
     const canDelete = inPool || t.config_present || t.link_up || iface.startsWith('awg') || iface.startsWith('wg');
 
     return '<div class="routing-row">' +
-      '<div class="routing-iface">' + esc(iface) +
-      (isSelected ? '<span class="routing-tag">active</span>' : '') +
-      (isPinned ? '<span class="routing-tag">pinned</span>' : '') +
+      '<div class="routing-row-top">' +
+        '<div class="routing-iface"><span class="routing-iface-name">' + esc(iface) + '</span>' +
+        (isSelected ? '<span class="routing-tag">active</span>' : '') +
+        (isPinned ? '<span class="routing-tag">pinned</span>' : '') +
+        '</div>' +
+        '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
       '</div>' +
-      '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
-      '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +
-      '<div class="routing-xfer">' + esc(xfer) + '</div>' +
-      '<div class="routing-actions">' +
+      '<div class="routing-row-bottom">' +
+        '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +
+        '<div class="routing-xfer">' + esc(xfer) + '</div>' +
+      '</div>' +
       (canDelete
-        ? '<button class="ui-btn danger routing-delete" type="button" data-iface="' + esc(iface) + '" aria-label="Delete tunnel ' + esc(iface) + '">Delete</button>'
+        ? '<div class="routing-actions"><button class="ui-btn danger routing-delete" type="button" data-iface="' + esc(iface) + '" aria-label="Delete tunnel ' + esc(iface) + '">' + ICON['delete'] + '</button></div>'
         : '') +
-      '</div>' +
       '</div>';
   }).join('');
 
@@ -1130,27 +1230,34 @@ function fmtHandshakeAge(sec) {
   return Math.floor(sec / 3600) + 'h';
 }
 
-function renderEgress(egress) {
-  lastEgress = egress;
+function renderEgress(egress, opts) {
+  const options = opts || {};
+  if (!options.transient) lastEgress = egress;
   const card = $('egressCard');
   if (!card) return;
 
   if (!egress || !egress.tunnels || egress.tunnels.length === 0) {
-    card.style.display = 'none';
+    if (!options.transient) card.style.display = 'none';
     return;
   }
 
   card.style.display = '';
 
-  const summary = egress.summary || {};
-  const summaryText = LANG === 'ru' ? summary.ru : summary.en;
+  const tunnels = egress.tunnels || [];
+  const degradedCount = tunnels.filter((tun) => tun && (tun.quality === 'degraded' || tun.quality === 'poor')).length;
+  const downCount = tunnels.filter((tun) => tun && tun.quality === 'down').length;
+  const summaryText = tunnels.length
+    ? (tunnels.length + ' · ' + (degradedCount
+      ? (degradedCount + ' degraded')
+      : (downCount ? (downCount + ' down') : 'healthy')))
+    : '—';
   const summaryEl = $('egressSummary');
   if (summaryEl) summaryEl.textContent = summaryText || '—';
 
   const list = $('egressList');
   if (!list) return;
 
-  list.innerHTML = (egress.tunnels || []).map((tun) => {
+  list.innerHTML = tunnels.map((tun) => {
     const iface = esc(tun.interface || '—');
     const isPrimary = tun.is_primary;
     const quality = tun.quality || 'unknown';
@@ -1165,25 +1272,51 @@ function renderEgress(egress) {
     // Color code quality (good, degraded, poor, up, down, unknown)
     const qualityClass = 'egress-quality-' + quality;
     const qualityLabel = t('egress.' + quality) || quality;
+    const _barPct = { good: 22, degraded: 72, poor: 92, up: 10, down: 100, unknown: 8 };
+    const barPct = _barPct[quality] != null ? _barPct[quality] : 8;
 
     // "Tunnel is the bottleneck" hint when quality is degraded/poor.
     const isBottleneck = quality === 'degraded' || quality === 'poor';
     const bottleneck = isBottleneck
-      ? '<div class="egress-bottleneck" title="' + t('egress.bottleneck') + '">⚠ ' + t('egress.bottleneck') + '</div>'
+      ? '<div class="egress-bottleneck" title="' + t('egress.bottleneck') + '">' + ICON['warning'] + '<span>' + t('egress.bottleneck') + '</span></div>'
       : '';
 
-    return '<div class="egress-row' + (isBottleneck ? ' is-bottleneck' : '') + '">' +
-      '<div class="egress-iface">' + iface +
-      (isPrimary ? '<span class="routing-tag">' + t('egress.primary') + '</span>' : '') +
+    return '<div class="egress-row' + (isBottleneck ? ' is-bottleneck' : '') + ' q-' + quality + '">' +
+      '<div class="egress-row-top">' +
+        '<div class="egress-iface q-' + quality + '"><span class="signal-sq"></span><span class="egress-iface-name">' + iface + '</span>' +
+        (isPrimary ? '<span class="routing-tag">' + t('egress.primary') + '</span>' : '') +
+        '</div>' +
+        '<div class="egress-quality ' + qualityClass + '">' + qualityLabel + '</div>' +
       '</div>' +
-      '<div class="egress-status ' + (tun.up ? 'on' : 'off') + '">' + (tun.up ? t('status.online') : t('status.offline')) + '</div>' +
-      '<div class="egress-quality ' + qualityClass + '">' + qualityLabel + '</div>' +
-      '<div class="egress-rtt" title="' + t('egress.rtt') + '">' + rttText + '</div>' +
-      '<div class="egress-loss" title="' + t('egress.loss') + '">' + lossText + '</div>' +
-      '<div class="egress-hs" title="' + t('egress.handshake') + '">' + hsText + '</div>' +
+      '<div class="egress-metrics"><div class="egress-stats">' + rttText + ' · ' + lossText + ' loss · hs ' + hsText + '</div></div>' +
+      '<div class="egress-bar"><div class="egress-bar-fill q-' + quality + '" style="width:' + barPct + '%"></div></div>' +
       bottleneck +
       '</div>';
   }).join('');
+}
+
+function renderEgressFromRouting(routing) {
+  if (lastEgress && Array.isArray(lastEgress.tunnels) && lastEgress.tunnels.length) return;
+  const tunnels = routing && Array.isArray(routing.tunnels) ? routing.tunnels : [];
+  if (!tunnels.length) return;
+
+  const fallbackEgress = {
+    ok: true,
+    primary_interface: routing.active_tunnel_interface || routing.selected_tunnel_interface || '',
+    tunnels: tunnels.map((tun) => {
+      const iface = String(tun.interface || '—');
+      return {
+        interface: iface,
+        up: Boolean(tun.link_up || tun.active || tun.healthy),
+        handshake_age_sec: null,
+        rtt_ms: null,
+        packet_loss_pct: null,
+        quality: tun.healthy ? 'good' : ((tun.link_up || tun.active) ? 'up' : 'down'),
+        is_primary: iface === (routing.active_tunnel_interface || routing.selected_tunnel_interface || ''),
+      };
+    }),
+  };
+  renderEgress(fallbackEgress, { transient: true });
 }
 
 // ── Polling ──
@@ -1203,8 +1336,8 @@ async function poll() {
   $('memSub').textContent = d.mem_used + ' / ' + d.mem_total + ' MB';
 
   // Sparklines
-  if (d.cpu_history) drawSpark('cpuSpark', d.cpu_history, 'rgb(247,164,29)', 100, '%');
-  if (d.mem_history) drawSpark('memSpark', d.mem_history, 'rgb(167,139,250)', 100, '%');
+  if (d.cpu_history) drawSpark('cpuSpark', d.cpu_history, 'rgb(154,163,174)', 100, '%');
+  if (d.mem_history) drawSpark('memSpark', d.mem_history, 'rgb(154,163,174)', 100, '%');
 
   // Network
   drawNetChart();
@@ -1214,12 +1347,17 @@ async function poll() {
   $('txTotal').textContent = fmtT(d.net_tx_total);
 
   // Server
-  $('srvUptime').textContent = d.uptime;
   const pi = d.proxy_info || {};
-  $('proxyUp').textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : (t('status.online') + ' · ' + (pi.uptime || '')));
-  $('proxyPid').textContent = pi.pid || '—';
-  $('proxyRss').textContent = (pi.rss_mb || 0) + ' MB';
-  $('statusBadge').className = pi.online ? 'badge' : 'badge off';
+  const proxyUpEl = $('proxyUp');
+  if (proxyUpEl) proxyUpEl.textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : t('status.online'));
+  const pidEl = $('proxyPid');
+  if (pidEl) pidEl.textContent = pi.pid || '—';
+  const rssEl = $('proxyRss');
+  if (rssEl) rssEl.textContent = (pi.rss_mb || 0) + ' MB';
+  const uptimeEl = $('proxyUptime');
+  if (uptimeEl) uptimeEl.textContent = pi.uptime || d.uptime || '—';
+  const statusBadgeEl = $('statusBadge');
+  if (statusBadgeEl) statusBadgeEl.className = pi.online ? 'badge' : 'badge off';
 
   // Proxy stats
   const p = d.proxy || {};
@@ -1230,6 +1368,12 @@ async function poll() {
   }
   window._prevActive = _act;
   setStatusHero(pi.online, _act, pi.state);
+  // hero right-side figures (Paper parity)
+  const _hc = $('heroConnected'); if (_hc) _hc.textContent = _act;
+  const _hu = $('heroUptime'); if (_hu) _hu.textContent = pi.uptime || d.uptime || '—';
+  // CPU masthead "peak N%" (Paper parity)
+  const _cp = $('cpuPeak');
+  if (_cp) { const _pk = Math.max(Number(d.cpu) || 0, ...((d.cpu_history || []).map((p) => Number(p.v) || 0))); _cp.textContent = Math.round(_pk) + '%'; }
   $('pxActive').textContent = _act;
   $('pxMax').textContent = p.max || 0;
   $('pxHs').textContent = p.hs_inflight || 0;
@@ -1248,6 +1392,7 @@ async function poll() {
   }
 
   renderRouting(d.routing || null);
+  renderEgressFromRouting(d.routing || null);
 
   // Egress / tunnel quality — fire-and-forget so a slow server-side ping/wg probe
   // never blocks rendering of the already-fetched masking/users data or stalls the
@@ -1266,48 +1411,41 @@ async function poll() {
     mc.style.display = '';
 
     const maskBadge = $('maskBadge');
+    const maskStatus = $('maskStatus');
+    const maskModeName = masking.enabled ? 'FakeTLS' : t('status.disabled');
     if (!masking.enabled) {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = t('status.disabled');
+      maskStatus.textContent = maskModeName;
     } else if (masking.mode === 'remote') {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = t('status.remoteMode');
+      maskStatus.textContent = maskModeName;
     } else if (masking.healthy) {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = t('status.healthy');
+      maskStatus.textContent = maskModeName;
     } else {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = t('status.needsAttention');
+      maskStatus.textContent = maskModeName;
     }
 
-    let modeText = masking.mode || '—';
-    if (masking.mode === 'remote') {
-      modeText = 'remote (' + (masking.tls_domain || '—') + ':443)';
-    } else if (masking.mode === 'custom') {
-      modeText = 'custom';
-    } else if (masking.mode === 'local' && masking.using_netns) {
-      modeText = 'local (netns)';
-    } else if (masking.mode === 'local') {
-      modeText = 'local';
-    }
-    $('maskMode').textContent = modeText;
+    const protectedText = LANG === 'ru' ? 'Защищено' : 'Protected';
+    const disabledText = LANG === 'ru' ? 'Выключено' : 'Disabled';
+    const activeText = LANG === 'ru' ? 'Активен' : 'Active';
+    const downText = LANG === 'ru' ? 'Отключён' : 'Down';
+    const timerOkText = LANG === 'ru' ? 'OK · каждые 30с' : 'OK · every 30s';
+    const modeText = masking.enabled
+      ? '<span class="signal-sq"></span>' + protectedText
+      : '<span class="signal-sq"></span>' + disabledText;
+    $('maskMode').innerHTML = modeText;
 
-    let endpointText = masking.target || '—';
-    if (masking.mode === 'local' || masking.mode === 'custom') {
-      if (masking.endpoint_ok === true) {
-        endpointText += ' (' + t('status.endpointOk') + ')';
-      } else if (masking.endpoint_ok === false) {
-        endpointText += ' (' + t('status.endpointDown') + ')';
-      }
-    }
+    let endpointText = masking.tls_domain ? (masking.tls_domain + ':443') : (masking.target || '—');
     $('maskTarget').textContent = endpointText;
 
-    const nginxState = (masking.nginx_active ? 'active' : 'down') + ' / ' +
-      (masking.nginx_enabled ? 'enabled' : 'disabled');
-    $('maskNginx').textContent = nginxState;
+    const nginxState = masking.nginx_active
+      ? '<span class="signal-sq"></span>' + activeText
+      : '<span class="signal-sq"></span>' + downText;
+    $('maskNginx').innerHTML = nginxState;
 
-    const timerState = (masking.health_timer_active ? 'active' : 'down') + ' / ' +
-      (masking.health_timer_enabled ? 'enabled' : 'disabled');
+    const timerState = masking.health_timer_active ? timerOkText : downText;
     $('maskTimer').textContent = timerState;
   }
 
@@ -1324,11 +1462,12 @@ function setStaleMode(stale) {
 }
 
 function updateFreshness() {
+  const lastUpdateEl = $('lastUpdate');
   if (!lastSuccessAt) {
-    $('lastUpdate').textContent = 'never';
+    if (lastUpdateEl) lastUpdateEl.textContent = 'never';
   } else {
     const age = Math.floor((Date.now() - lastSuccessAt) / 1000);
-    $('lastUpdate').textContent = age <= 0 ? 'just now' : age + 's ago';
+    if (lastUpdateEl) lastUpdateEl.textContent = age <= 0 ? 'just now' : age + 's ago';
   }
 
   if (pollingPaused) {
@@ -1356,8 +1495,12 @@ function updateFreshness() {
 }
 
 function updatePollControls() {
-  $('pollToggle').textContent = pollingPaused ? t('btn.resume') : t('btn.pause');
-  $('pollToggle').classList.toggle('active', !pollingPaused);
+  const btn = $('pollToggle');
+  // .icon-btn hides text (font-size:0); show a play/pause SVG instead.
+  btn.innerHTML = pollingPaused ? ICON.play : ICON.pause;
+  btn.title = pollingPaused ? t('btn.resume') : t('btn.pause');
+  btn.setAttribute('aria-label', btn.title);
+  btn.classList.toggle('active', !pollingPaused);
 }
 
 async function runPoll() {
@@ -1367,6 +1510,7 @@ async function runPoll() {
     await poll();
     hasPollError = false;
     lastSuccessAt = Date.now();
+    appRoot.classList.remove('is-loading');
   } catch (e) {
     hasPollError = true;
     console.error(e);
@@ -1398,6 +1542,7 @@ $('pollInterval').addEventListener('change', (ev) => {
   const v = Number(ev.target.value);
   if (!v || v === pollIntervalMs) return;
   pollIntervalMs = v;
+  updateNetworkWindowLabel();
   restartPollingLoop();
   updateFreshness();
 });
@@ -1418,6 +1563,7 @@ if (langToggleBtn) {
 }
 applyStaticI18n();
 
+updateNetworkWindowLabel();
 updatePollControls();
 updateFreshness();
 setupAddUserForm();
@@ -1445,8 +1591,14 @@ function jumpToLatest() {
 }
 
 function updateAutoScrollButton() {
-  autoScrollBtn.textContent = autoScrollEnabled ? t('autoscroll.on') : t('autoscroll.off');
+  if (!autoScrollBtn) return;
+  const label = autoScrollBtn.querySelector('.log-ctl-label');
+  if (label) label.textContent = 'Auto-scroll';
+  else autoScrollBtn.textContent = 'Auto-scroll';
   autoScrollBtn.classList.toggle('active', autoScrollEnabled);
+  autoScrollBtn.setAttribute('aria-pressed', autoScrollEnabled ? 'true' : 'false');
+  autoScrollBtn.setAttribute('aria-label', autoScrollEnabled ? 'Auto-scroll on' : 'Auto-scroll off');
+  autoScrollBtn.title = autoScrollEnabled ? 'Auto-scroll on' : 'Auto-scroll off';
 }
 
 function shouldShowLine(el) {
@@ -1483,13 +1635,15 @@ logSearchInput.addEventListener('input', () => {
   applyAllLogFilters();
 });
 
-autoScrollBtn.addEventListener('click', () => {
-  autoScrollEnabled = !autoScrollEnabled;
-  if (autoScrollEnabled) jumpToLatest();
-  updateAutoScrollButton();
-});
+if (autoScrollBtn) {
+  autoScrollBtn.addEventListener('click', () => {
+    autoScrollEnabled = !autoScrollEnabled;
+    if (autoScrollEnabled) jumpToLatest();
+    updateAutoScrollButton();
+  });
+}
 
-jumpLatestBtn.addEventListener('click', jumpToLatest);
+if (jumpLatestBtn) jumpLatestBtn.addEventListener('click', jumpToLatest);
 updateAutoScrollButton();
 
 function addLine(d, anim) {
