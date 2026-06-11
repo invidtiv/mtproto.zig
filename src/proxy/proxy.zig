@@ -29,6 +29,7 @@ const MessageQueue = @import("message_queue.zig").MessageQueue;
 const queue_io = @import("queue_io.zig");
 const middle_proxy_routing = @import("middle_proxy_routing.zig");
 const socket_utils = @import("socket_utils.zig");
+const proxy_protocol = @import("proxy_protocol.zig");
 const network_detect = @import("network_detect.zig");
 const http_fetch = @import("http_fetch.zig");
 const fd_limits = @import("fd_limits.zig");
@@ -57,6 +58,7 @@ test {
     _ = @import("socket_utils.zig");
     _ = @import("network_detect.zig");
     _ = @import("http_fetch.zig");
+    _ = @import("proxy_protocol.zig");
     _ = @import("sd_notify.zig");
     _ = @import("fd_limits.zig");
     _ = @import("connection_phase.zig");
@@ -396,6 +398,19 @@ fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8
     return allocator.dupe(u8, trimmed) catch null;
 }
 
+/// Fetch the `Date:` header from an HTTPS URL (via curl HEAD) and return the offset
+/// (seconds) to add to the local clock so it matches, clamped to ±1 day. Used to correct
+/// a skewed VPS clock that would otherwise fail the handshake time-skew check for everyone.
+fn fetchClockOffsetSeconds(allocator: std.mem.Allocator, url: []const u8) ?i64 {
+    // `-w %header{date}` prints ONLY the Date header value (tiny, always within the small
+    // runSmallCommand stdout cap), unlike full `-I` headers where Date could be truncated.
+    const out = runSmallCommand(allocator, &.{ "curl", "-sS", "-o", "/dev/null", "--max-time", "8", "-w", "%header{date}", url }) orelse return null;
+    defer allocator.free(out);
+    const http_epoch = http_fetch.parseHttpDate(out) orelse return null;
+    const off = http_epoch - realtimeSeconds();
+    return @max(@as(i64, -86400), @min(@as(i64, 86400), off));
+}
+
 fn detectActiveTunnelInterface(allocator: std.mem.Allocator) ?[]u8 {
     var table_buf: [16]u8 = undefined;
     const table = std.fmt.bufPrint(&table_buf, "{d}", .{tunnel_route_table}) catch "200";
@@ -555,6 +570,9 @@ const ConnectionSlot = struct {
     /// One-shot override for the next startMasking (SNI-following safelist hit).
     /// Consumed (read + cleared) inside startMasking so it never leaks to a reused slot.
     mask_addr_override: ?Address = null,
+    /// Expect a HAProxy PROXY-protocol header before the TLS ClientHello (set at accept
+    /// when accept_proxy_protocol is on; cleared once the header is consumed).
+    expect_proxy_header: bool = false,
 
     // Non-blocking MiddleProxy handshake state
     mp_step: MiddleProxyHandshakeStep = .none,
@@ -1139,8 +1157,11 @@ pub const ProxyState = struct {
     mask_addr: ?Address,
     /// Opt-in SNI-following mask targets (config.mask_sni_safelist), resolved at boot.
     mask_safelist: []const MaskSafelistEntry,
+    /// Startup HTTP-Date clock correction (seconds); 0 if disabled or unavailable.
+    clock_offset_seconds: i64,
     replay_cache: ReplayCache,
-    tls_server_hello_template: [tls.server_hello_template_len]u8,
+    /// FakeTLS ServerHello template (heap; size varies with fake_cert_size).
+    tls_server_hello_template: []const u8,
 
     // Degradation counters (monotonic totals, delta'd in stats log)
     stats_dropped_cap: std.atomic.Value(u64),
@@ -1265,6 +1286,28 @@ pub const ProxyState = struct {
         }
         const mask_safelist = mask_safelist_buf.toOwnedSlice(allocator) catch &.{};
 
+        // Optional startup clock correction from an HTTPS Date header.
+        var clock_offset_seconds: i64 = 0;
+        if (cfg.clock_sync_url) |url| {
+            if (fetchClockOffsetSeconds(allocator, url)) |off| {
+                clock_offset_seconds = off;
+                log.info("clock_sync: applied {d}s server-clock correction from {s}", .{ off, url });
+            } else {
+                log.warn("clock_sync: could not read a Date header from {s}", .{url});
+            }
+        }
+
+        // FakeTLS ServerHello template, sized to a profile-matched fake-cert record when
+        // fake_cert_size is set (else the default ~2878). Falls back to the default size
+        // if the configured value can't be built.
+        const fake_cert_size: usize = if (cfg.fake_cert_size == 0)
+            tls.default_fake_cert_size
+        else
+            std.math.clamp(@as(usize, cfg.fake_cert_size), tls.min_fake_cert_size, tls.max_fake_cert_size);
+        const tls_template = tls.buildServerHelloTemplateAlloc(allocator, fake_cert_size) catch
+            try tls.buildServerHelloTemplateAlloc(allocator, tls.default_fake_cert_size);
+        errdefer allocator.free(tls_template);
+
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
@@ -1304,8 +1347,9 @@ pub const ProxyState = struct {
             .saturation_paused = std.atomic.Value(bool).init(false),
             .mask_addr = resolved_addr,
             .mask_safelist = mask_safelist,
+            .clock_offset_seconds = clock_offset_seconds,
             .replay_cache = ReplayCache.init(),
-            .tls_server_hello_template = tls.buildServerHelloTemplate(null),
+            .tls_server_hello_template = tls_template,
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
             .stats_dropped_saturation = std.atomic.Value(u64).init(0),
             .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
@@ -1428,6 +1472,7 @@ pub const ProxyState = struct {
         }
         self.flood_guard.destroy(self.allocator);
         self.allocator.free(self.mask_safelist);
+        self.allocator.free(self.tls_server_hello_template);
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         freeUserMetricsSlice(self.allocator, self.user_metrics);
@@ -2412,8 +2457,13 @@ const EventLoop = struct {
             const client_addr = accepted.?.addr;
             accepted_this_round += 1;
 
+            // Behind a PROXY-protocol LB, the accepted address is the load balancer's, not
+            // the client's, so per-IP flood/subnet checks here are meaningless (they'd rate
+            // the LB). They run on the real client address once the PROXY header is parsed
+            // (peer_addr) via the per-handshake flood machinery.
+            const proxy_proto = self.state.config.accept_proxy_protocol;
             const flood_cfg = floodGuardSettings(&self.state.config);
-            if (self.state.floodIsBlocked(client_addr, flood_cfg)) {
+            if (!proxy_proto and self.state.floodIsBlocked(client_addr, flood_cfg)) {
                 _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
                 closeFd(cfd);
                 continue;
@@ -2423,7 +2473,7 @@ const EventLoop = struct {
             setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
+            if (!proxy_proto and !self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
                 _ = self.state.floodRecord(client_addr, .rate_limit, flood_cfg);
                 closeFd(cfd);
@@ -2463,6 +2513,7 @@ const EventLoop = struct {
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
+            slot.expect_proxy_header = proxy_proto;
             slot.client_transport = .fake_tls;
             slot.phase = .reading_tls_header;
             slot.handshake_pos = 0;
@@ -3193,7 +3244,69 @@ const EventLoop = struct {
         }
     }
 
+    const ProxyHeaderStep = enum { done, wait, closed };
+
+    /// MSG_PEEK the connection's first bytes, parse a HAProxy PROXY-protocol header, and
+    /// drain exactly its bytes (leaving the TLS ClientHello untouched in the socket buffer)
+    /// so peer_addr reflects the real client behind a load balancer.
+    fn tryConsumeProxyHeader(self: *EventLoop, slot: *ConnectionSlot) ProxyHeaderStep {
+        var peek: [256]u8 = undefined;
+        const msg_peek: u32 = 0x2; // MSG_PEEK (Linux)
+        const rc = posix.system.recvfrom(slot.client_fd, &peek, peek.len, msg_peek, null, null);
+        const n: usize = switch (posix.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN, .INTR => return .wait,
+            else => {
+                self.closeSlot(slot, "proxy header read error");
+                return .closed;
+            },
+        };
+        if (n == 0) {
+            self.closeSlot(slot, "client eof before proxy header");
+            return .closed;
+        }
+        switch (proxy_protocol.parse(peek[0..n])) {
+            .incomplete => {
+                if (n >= peek.len) {
+                    self.closeSlot(slot, "proxy header too long");
+                    return .closed;
+                }
+                return .wait;
+            },
+            .invalid => {
+                self.closeSlot(slot, "invalid proxy header");
+                return .closed;
+            },
+            .ok => |res| {
+                var drain: [256]u8 = undefined;
+                var left: usize = res.consumed;
+                while (left > 0) {
+                    const got = posix.read(slot.client_fd, drain[0..@min(left, drain.len)]) catch {
+                        self.closeSlot(slot, "proxy header drain error");
+                        return .closed;
+                    };
+                    if (got == 0) {
+                        self.closeSlot(slot, "client eof draining proxy header");
+                        return .closed;
+                    }
+                    left -= got;
+                }
+                if (res.src) |real| slot.peer_addr = real;
+                slot.expect_proxy_header = false;
+                slot.last_activity_ms = nowMs();
+                return .done;
+            },
+        }
+    }
+
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.expect_proxy_header) {
+            switch (self.tryConsumeProxyHeader(slot)) {
+                .done => {},
+                .wait => return,
+                .closed => return,
+            }
+        }
         while (slot.tls_hdr_pos < tls_header_len) {
             const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
                 if (err == error.WouldBlock) return;
@@ -3337,6 +3450,7 @@ const EventLoop = struct {
             client_hello,
             self.state.user_secrets,
             false,
+            self.state.clock_offset_seconds,
         ) catch null;
 
         if (validation == null) {
@@ -3407,6 +3521,7 @@ const EventLoop = struct {
                 &slot.validation_digest,
                 session_id,
                 echoed_cipher,
+                self.state.tls_server_hello_template.len - tls.server_hello_prefix_len,
             )
         else
             tls.buildServerHelloWithTemplate(
@@ -4189,6 +4304,12 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+                if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
+                    now_ms - slot.created_at_ms > secondsToMs(self.state.config.mask_relay_max_secs))
+                {
+                    self.closeSlot(slot, "mask relay max duration");
+                    continue;
+                }
                 if (now_ms - slot.last_activity_ms > (if (slot.idle_timeout_ms > 0) slot.idle_timeout_ms else secondsToMs(self.state.config.idle_timeout_sec))) {
                     self.closeSlot(slot, "relay idle timeout");
                     continue;

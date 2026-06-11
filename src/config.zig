@@ -207,6 +207,14 @@ pub const Config = struct {
     /// all interfaces ([::]  with IPv4 fallback to 0.0.0.0).
     /// Set to a specific IP when sharing the host with other services.
     bind_address: ?[]const u8 = null,
+    /// Optional HTTPS URL whose `Date:` header is used at startup to correct a skewed
+    /// server clock (so a wrong VPS clock doesn't silently reject every handshake on the
+    /// time-skew check). Unset = no correction. The offset is clamped to ±1 day.
+    clock_sync_url: ?[]const u8 = null,
+    /// Expect a HAProxy PROXY-protocol header (v1 or v2) before each connection's TLS, so
+    /// the real client IP is recovered when sitting behind a TLS-terminating load balancer.
+    /// Enable ONLY when every connection truly arrives via such an LB. Default off.
+    accept_proxy_protocol: bool = false,
     /// Explicit public IP address. If set, bypasses detection via external services.
     public_ip: ?[]const u8 = null,
     /// Explicit public port shown in generated Telegram client links.
@@ -274,6 +282,16 @@ pub const Config = struct {
     mask_target: ?[]const u8 = null,
     /// Port used by the masking backend.
     mask_port: u16 = 443,
+    /// Max lifetime (seconds) for a masking-relay connection (a probe forwarded to the
+    /// backend). 0 = unlimited. Bounds how long an active prober/scanner can hold a
+    /// backend connection open through us; idle masking relays are already idle-timed.
+    mask_relay_max_secs: u32 = 0,
+    /// Size (bytes) of the fake encrypted-certificate AppData record in the FakeTLS
+    /// ServerHello. 0 = default (~2878, a typical nginx + Let's Encrypt ECDSA chain). Set
+    /// it to the first encrypted-flight record size your masking backend actually serves so
+    /// an active prober sees the same cert-record size on both the accept and mask paths
+    /// (measure with e.g. `openssl s_client -msg`). Clamped to 256..16384.
+    fake_cert_size: u32 = 0,
     /// Reject the non-TLS "direct obfuscated" (dd / secure) transport. When true
     /// (the default), only FakeTLS (ee) clients are accepted and any non-TLS
     /// first bytes are masked immediately — eliminating the dd active-probe
@@ -641,6 +659,11 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "bind_address")) {
                         if (cfg.bind_address) |prev| allocator.free(prev);
                         cfg.bind_address = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "clock_sync_url")) {
+                        if (cfg.clock_sync_url) |prev| allocator.free(prev);
+                        cfg.clock_sync_url = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "accept_proxy_protocol")) {
+                        cfg.accept_proxy_protocol = parseBool(value);
                     } else if (std.mem.eql(u8, key, "backlog")) {
                         cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
                     } else if (std.mem.eql(u8, key, "max_connections")) {
@@ -744,7 +767,12 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "reject_rst")) {
                         cfg.reject_rst = parseBool(value);
                     } else if (std.mem.eql(u8, key, "mask_sni_safelist")) {
+                        freeStringSlice(allocator, cfg.mask_sni_safelist);
                         cfg.mask_sni_safelist = parseStringArrayValue(allocator, value) catch &.{};
+                    } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
+                        cfg.mask_relay_max_secs = std.fmt.parseInt(u32, value, 10) catch cfg.mask_relay_max_secs;
+                    } else if (std.mem.eql(u8, key, "fake_cert_size")) {
+                        cfg.fake_cert_size = std.fmt.parseInt(u32, value, 10) catch cfg.fake_cert_size;
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
@@ -848,11 +876,15 @@ pub const Config = struct {
             allocator.free(iface);
         }
         freeStringSlice(allocator, self.upstream_tunnel_interfaces);
+        freeStringSlice(allocator, self.mask_sni_safelist);
         if (self.upstream_tunnel_pinned_interface) |iface| {
             allocator.free(iface);
         }
         if (self.bind_address) |ba| {
             allocator.free(ba);
+        }
+        if (self.clock_sync_url) |u| {
+            allocator.free(u);
         }
         if (self.metrics.host) |h| {
             allocator.free(h);
@@ -957,6 +989,24 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u16, 9400), cfg.metrics.port);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
     try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
+}
+
+test "parse config - mask_sni_safelist parses and frees cleanly" {
+    const content =
+        \\[censorship]
+        \\tls_domain = "example.com"
+        \\mask_sni_safelist = ["a.example", "b.example"]
+        \\mask_sni_safelist = ["c.example"]
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    // The duplicate key exercises free-before-reassign; deinit must free the slice
+    // (the testing allocator fails the test on any leak or double-free).
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mask_sni_safelist.len);
+    try std.testing.expectEqualStrings("c.example", cfg.mask_sni_safelist[0]);
 }
 
 test "parse config - custom mask target" {

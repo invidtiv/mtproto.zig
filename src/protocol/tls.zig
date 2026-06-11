@@ -44,6 +44,7 @@ pub fn validateTlsHandshake(
     handshake: []const u8,
     secrets: []const UserSecret,
     ignore_time_skew: bool,
+    clock_offset_seconds: i64,
 ) !?TlsValidation {
     _ = allocator;
 
@@ -65,7 +66,7 @@ pub fn validateTlsHandshake(
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
-    const now: i64 = if (!ignore_time_skew) realtimeSeconds() else 0;
+    const now: i64 = if (!ignore_time_skew) realtimeSeconds() + clock_offset_seconds else 0;
 
     for (secrets) |entry| {
         var hmac = HmacSha256.init(&entry.secret);
@@ -151,7 +152,11 @@ pub fn buildServerHelloWithTemplate(
     session_id: []const u8,
     cipher: ?u16,
 ) ![]u8 {
-    if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
+    // The ServerHello+CCS+AppData-header prefix is a fixed 138 bytes; only the trailing
+    // fake-cert (AppData body) size varies. Accept any template whose length leaves room
+    // for that prefix, so a profile-matched cert size (see buildServerHelloTemplateAlloc)
+    // works through the same patch path.
+    if (template.len < tmpl_appdata_offset) return error.BadServerHelloTemplate;
 
     // 1. Copy the pre-built Nginx template (random and session_id are zeroed in template)
     const response = try allocator.alloc(u8, template.len);
@@ -186,7 +191,7 @@ pub fn buildServerHelloWithTemplate(
     //     a passive FakeTLS distinguisher. The client never inspects this body
     //     and the HMAC in step 4 covers it, so fresh randomness is protocol-safe.
     //     The record length stays fixed, preserving the size fingerprint.
-    crypto.randomBytes(response[tmpl_appdata_offset..][0..fake_cert_payload_len]);
+    crypto.randomBytes(response[tmpl_appdata_offset..]);
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
@@ -237,7 +242,8 @@ pub const pq_server_hello_len: usize = pq_server_hello_record_len + 6 + 5 + fake
 /// Offset of the 1120-byte PQ key_share inside the response.
 const pq_key_offset: usize = 95;
 /// Offset of the fake AppData body inside the PQ response.
-const pq_appdata_offset: usize = pq_server_hello_len - fake_cert_payload_len;
+/// Fixed prefix before the PQ AppData body: ServerHello record + CCS + AppData header.
+const pq_appdata_offset: usize = pq_server_hello_record_len + 6 + 5;
 
 /// Return true when the ClientHello carries a key_share entry for X25519MLKEM768
 /// (named group 0x11ec). Mirrors the key_share walk in formatClientHelloFingerprint.
@@ -291,9 +297,13 @@ pub fn buildServerHelloPq(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
     cipher: ?u16,
+    cert_len: usize,
 ) ![]u8 {
     if (session_id.len != 32) return error.BadSessionIdLength;
-    const r = try allocator.alloc(u8, pq_server_hello_len);
+    if (cert_len > 0xFFFF) return error.CertTooLarge;
+    // Match the fake-cert (AppData) record size used on the non-PQ path so a prober can't
+    // tell PQ vs classical clients apart by cert-record length.
+    const r = try allocator.alloc(u8, pq_appdata_offset + cert_len);
     errdefer allocator.free(r);
     @memset(r, 0);
 
@@ -341,8 +351,8 @@ pub fn buildServerHelloPq(
     r[ad] = 0x17;
     r[ad + 1] = 0x03;
     r[ad + 2] = 0x03;
-    std.mem.writeInt(u16, r[ad + 3 ..][0..2], fake_cert_payload_len, .big);
-    crypto.randomBytes(r[pq_appdata_offset..][0..fake_cert_payload_len]);
+    std.mem.writeInt(u16, r[ad + 3 ..][0..2], @intCast(cert_len), .big);
+    crypto.randomBytes(r[pq_appdata_offset..]);
 
     // HMAC over the full response (random field zeroed), prefixed by the client digest.
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -354,6 +364,35 @@ pub fn buildServerHelloPq(
     @memcpy(r[tmpl_random_offset..][0..32], &response_digest);
 
     return r;
+}
+
+/// Build a ServerHello template with a profile-matched fake-cert (AppData) record size.
+/// The fixed 138-byte ServerHello+CCS+AppData-header prefix is copied from the comptime
+/// template; only the AppData length field and body size differ. The result is patched
+/// per-connection by buildServerHelloWithTemplate just like the default template.
+pub fn buildServerHelloTemplateAlloc(allocator: std.mem.Allocator, cert_len: usize) ![]u8 {
+    if (cert_len > 0xFFFF) return error.CertTooLarge;
+    const t = try allocator.alloc(u8, tmpl_appdata_offset + cert_len);
+    errdefer allocator.free(t);
+    @memcpy(t[0..tmpl_appdata_offset], nginx_template[0..tmpl_appdata_offset]);
+    // Patch the AppData record's 2-byte length field (immediately before the body).
+    std.mem.writeInt(u16, t[tmpl_appdata_offset - 2 ..][0..2], @intCast(cert_len), .big);
+    crypto.randomBytes(t[tmpl_appdata_offset..]);
+    return t;
+}
+
+/// Walk a TLS record stream and return the payload length of the first Application Data
+/// (0x17) record, or null. Used to learn the mask origin's first encrypted-flight
+/// (certificate) record size so our fake cert record can match it instead of a fixed 2878.
+pub fn firstAppDataRecordLen(data: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos + 5 <= data.len) {
+        const rtype = data[pos];
+        const rlen = std.mem.readInt(u16, data[pos + 3 ..][0..2], .big);
+        if (rtype == 0x17) return rlen;
+        pos += 5 + rlen;
+    }
+    return null;
 }
 
 /// A TLS **fatal** `handshake_failure` alert record — what a server sends when it
@@ -391,6 +430,9 @@ const tmpl_x25519_key_offset: usize = 95;
 /// fresh per-connection random bytes at runtime so it isn't byte-identical
 /// across connections (which would be a passive DPI distinguisher).
 const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_len;
+/// Fixed ServerHello+CCS+AppData-header prefix length (138); a template's fake-cert size
+/// is `template.len - server_hello_prefix_len`.
+pub const server_hello_prefix_len: usize = tmpl_appdata_offset;
 
 /// Fake encrypted certificate payload size.
 /// 2878 bytes matches a typical Nginx + Let's Encrypt ECDSA P-256 cert chain:
@@ -398,6 +440,12 @@ const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_len;
 ///   Finished (~36) + AEAD tags (~50) + record layer overhead.
 /// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
 const fake_cert_payload_len: u16 = 2878;
+
+/// Default fake-cert (AppData) record size when not profile-matched via fake_cert_size.
+pub const default_fake_cert_size: usize = fake_cert_payload_len;
+/// Clamp bounds for a configured/profiled fake-cert size (sane TLS record sizes).
+pub const min_fake_cert_size: usize = 256;
+pub const max_fake_cert_size: usize = 16384;
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
 const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_len;
@@ -937,7 +985,7 @@ test "fuzz: TLS ClientHello parsers never panic on arbitrary input" {
             var fp_buf: [256]u8 = undefined;
             _ = formatClientHelloFingerprint(data, &fp_buf);
             const secrets = [_]UserSecret{.{ .name = "u", .secret = [_]u8{0x11} ** 16 }};
-            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true) catch {};
+            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true, 0) catch {};
         }
     }.one, .{});
 }
@@ -1057,7 +1105,7 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     const digest = [_]u8{0} ** constants.tls_digest_len;
     const sid = [_]u8{0x33} ** 32;
     const secret = [_]u8{0x42} ** 16;
-    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303);
+    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303, default_fake_cert_size);
     defer allocator.free(resp);
 
     try std.testing.expectEqual(pq_server_hello_len, resp.len);
@@ -1084,6 +1132,26 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     var expected: [32]u8 = undefined;
     h.final(&expected);
     try std.testing.expectEqualSlices(u8, &expected, resp[tmpl_random_offset..][0..32]);
+}
+
+test "buildServerHelloTemplateAlloc + firstAppDataRecordLen match a profile cert size" {
+    const allocator = std.testing.allocator;
+    const tmpl = try buildServerHelloTemplateAlloc(allocator, 1234);
+    defer allocator.free(tmpl);
+    try std.testing.expectEqual(@as(usize, tmpl_appdata_offset + 1234), tmpl.len);
+    try std.testing.expectEqual(@as(u8, 0x17), tmpl[127 + 6]); // AppData record type
+    try std.testing.expectEqual(@as(u16, 1234), std.mem.readInt(u16, tmpl[tmpl_appdata_offset - 2 ..][0..2], .big));
+
+    // The variable-size template patches through the normal builder.
+    const digest = [_]u8{0} ** constants.tls_digest_len;
+    const sid = [_]u8{0x33} ** 32;
+    const secret = [_]u8{0x42} ** 16;
+    const resp = try buildServerHelloWithTemplate(allocator, tmpl, &secret, &digest, &sid, 0x1301);
+    defer allocator.free(resp);
+    try std.testing.expectEqual(tmpl.len, resp.len);
+    try std.testing.expectEqual(@as(?usize, 1234), firstAppDataRecordLen(resp));
+    // No AppData record in a stream that has only ServerHello → null.
+    try std.testing.expectEqual(@as(?usize, null), firstAppDataRecordLen(resp[0..127]));
 }
 
 test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
@@ -1186,7 +1254,7 @@ test "validateTlsHandshake - valid handshake" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("bob", result.?.user);
     try std.testing.expectEqual(@as(u32, 0x12345678), result.?.timestamp);
@@ -1197,7 +1265,7 @@ test "validateTlsHandshake - invalid user" {
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
     var handshake = [_]u8{0xAA} ** 64; // random junk
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result == null);
 }
 
@@ -1221,7 +1289,7 @@ test "validateTlsHandshake - rejects non-32 session id" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result == null);
 }
 
@@ -1253,7 +1321,7 @@ test "validateTlsHandshake returns canonical_hmac" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result != null);
     try std.testing.expectEqualSlices(u8, &computed_mac, &result.?.canonical_hmac);
 }
@@ -1421,7 +1489,7 @@ test "validateTlsHandshake - fuzz random and replayed input" {
     for (0..3000) |_| {
         const len: usize = @as(usize, random.int(u16)) % random_buf.len;
         random.bytes(random_buf[0..len]);
-        const parsed = try validateTlsHandshake(allocator, random_buf[0..len], &secrets, true);
+        const parsed = try validateTlsHandshake(allocator, random_buf[0..len], &secrets, true, 0);
         if (parsed) |v| {
             try std.testing.expect(v.session_id.len == 32);
             try std.testing.expect(v.user.len > 0);
@@ -1431,8 +1499,8 @@ test "validateTlsHandshake - fuzz random and replayed input" {
     // Replayed bytes produce identical canonical HMAC.
     var hello_buf: [512]u8 = undefined;
     const hello = try buildTlsAuthClientHello(&hello_buf, secrets[0].secret, "google.com");
-    const first = try validateTlsHandshake(allocator, hello, &secrets, true);
-    const second = try validateTlsHandshake(allocator, hello, &secrets, true);
+    const first = try validateTlsHandshake(allocator, hello, &secrets, true, 0);
+    const second = try validateTlsHandshake(allocator, hello, &secrets, true, 0);
     try std.testing.expect(first != null and second != null);
     try std.testing.expectEqualSlices(u8, &first.?.canonical_hmac, &second.?.canonical_hmac);
 }
