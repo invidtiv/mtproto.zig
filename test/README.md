@@ -9,6 +9,14 @@ This folder contains practical tools to validate **capacity**, **stability**, an
 - `e2e/run.py` — process-level integration harness (`make e2e` / `zig build e2e`).
 - `installer-e2e/run.sh` — distro-matrix installer smoke, including tunnel dependency installers.
 
+The Debian 11 installer fixture uses the official final-LTS snapshots from
+2026-08-31: [Debian](https://snapshot.debian.org/archive/debian/20260831T204404Z/)
+and [Debian security](https://snapshot.debian.org/archive/debian-security/20260831T211327Z/).
+This avoids [removed bullseye-security packages](https://lists.debian.org/debian-mirrors/2026/09/msg00001.html)
+after LTS ended. Only those immutable test-image sources disable `Valid-Until`;
+APT still verifies Debian archive signatures and package hashes. Other distro
+fixtures, host APT configuration and production installation sources are unchanged.
+
 ## E2E Harness
 
 Run all integration scenarios in one command:
@@ -252,3 +260,12 @@ The dashboard suite also checks that traffic sampling creates no TLS contexts,
 ignores environment proxies, refuses redirects and oversized responses, and can
 pause/resume local history independently of Prometheus without modifying its
 saved database while paused or counting the paused interval.
+
+## WEB protocol regressions
+
+`zig build web-bridge` checks bounded browser queues, native frame splitting, exact
+loopback-parent adoption, pagehide cleanup, nonce-bearing token bootstrap, and carrier
+loss. WEB Linux E2E cases obtain a short-lived token from the actual bridge response
+and use the echoed WebSocket subprotocol. `zig build test` also covers retained relay
+buffer allocation budgets, frame-count limits, closed-stream history, canonical HTTP
+routing, token expiry/reuse, operator public files and trusted HTTP terminators.
